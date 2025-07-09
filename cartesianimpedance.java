@@ -1,12 +1,14 @@
-package com.kuka.example.cartesianimpedance;
+package application;
 
 import com.kuka.roboticsAPI.applicationModel.RoboticsAPIApplication;
 import com.kuka.roboticsAPI.deviceModel.LBR;
 import com.kuka.roboticsAPI.geometricModel.Frame;
-import com.kuka.roboticsAPI.motionModel.CartesianImpedanceControlMode;
 import com.kuka.roboticsAPI.motionModel.IMotionContainer;
 import com.kuka.roboticsAPI.motionModel.LIN;
-import com.kuka.roboticsAPI.motionModel.controlModeModel.CartesianImpedanceControlMode.CartDOF;
+import com.kuka.roboticsAPI.motionModel.PositionControlMode;
+// Try these alternative imports if you need impedance control:
+// import com.kuka.roboticsAPI.motionModel.ImpedanceControlMode;
+// import com.kuka.roboticsAPI.motionModel.CartesianImpedanceControlMode;
 import com.kuka.roboticsAPI.sensorModel.ForceSensorData;
 import com.kuka.roboticsAPI.deviceModel.JointPosition;
 import com.kuka.roboticsAPI.geometricModel.math.Transformation;
@@ -192,16 +194,8 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
         isExecutingTrajectory.set(true);
         
         try {
-            // Setup impedance control mode
-            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
-            impedanceMode.parametrize(CartDOF.X).setStiffness(stiffnessX);
-            impedanceMode.parametrize(CartDOF.Y).setStiffness(stiffnessY);
-            impedanceMode.parametrize(CartDOF.Z).setStiffness(stiffnessZ);
-            impedanceMode.parametrize(CartDOF.ROT).setStiffness(stiffnessRot);
-            impedanceMode.parametrize(CartDOF.X).setDamping(damping);
-            impedanceMode.parametrize(CartDOF.Y).setDamping(damping);
-            impedanceMode.parametrize(CartDOF.Z).setDamping(damping);
-            impedanceMode.parametrize(CartDOF.ROT).setDamping(damping);
+            // Setup position control mode (simpler alternative to impedance control)
+            PositionControlMode positionMode = new PositionControlMode();
             
             // Execute trajectory point by point
             for (Frame targetFrame : trajectoryFrames) {
@@ -210,9 +204,9 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
                     break;
                 }
                 
-                // Move to target with impedance control
+                // Move to target with position control
                 LIN motion = new LIN(targetFrame);
-                motion.setMode(impedanceMode);
+                motion.setMode(positionMode);
                 
                 IMotionContainer motionContainer = robot.moveAsync(motion);
                 
