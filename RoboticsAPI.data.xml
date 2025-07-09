@@ -3,36 +3,23 @@
     <world>
         <gravitation x="0.0" y="0.0" z="9.81"/>
     </world>
-    <objectTemplates>
-    </objectTemplates>
     <processDataContainer>
-        <!-- Existing communication settings -->
         <processData dataType="java.lang.Boolean" defaultValue="false" displayName="Communication: Use double precision" editableOnHmi="true" id="communication_double_precision" value="false"/>
         <processData dataType="java.lang.String" defaultValue="172.31.1.25" displayName="Controller: IP Address" editableOnHmi="true" id="controller_ip" value="172.31.1.25"/>
-        <processData dataType="java.lang.Integer" defaultValue="12225" displayName="Controller: Port" editableOnHmi="true" id="controller_port" max="65535" min="1024" value="12225"/>
-        
-        <!-- Logging settings -->
+        <processData dataType="java.lang.Integer" defaultValue="12225" displayName="Controller: Port" editableOnHmi="true" id="controller_port" max="65535.0" min="1024.0" value="12225"/>
         <processData dataType="java.lang.Boolean" defaultValue="false" displayName="Log to SmartPad: Info" editableOnHmi="true" id="verbose_info" value="false"/>
         <processData dataType="java.lang.Boolean" defaultValue="true" displayName="Log to SmartPad: Warning" editableOnHmi="true" id="verbose_warn" value="true"/>
         <processData dataType="java.lang.String" defaultValue="" displayName="Robot: Tools" editableOnHmi="false" id="tools" value=""/>
-        
-        <!-- Cartesian Impedance Controller Settings -->
-        <processData dataType="java.lang.String" defaultValue="192.168.1.100" displayName="ROS2 PC: IP Address" editableOnHmi="true" id="ros2_pc_ip" value="192.168.1.100"/>
-        <processData dataType="java.lang.Integer" defaultValue="30002" displayName="Trajectory: Server Port" editableOnHmi="true" id="trajectory_server_port" max="65535" min="1024" value="30002"/>
-        <processData dataType="java.lang.Integer" defaultValue="30003" displayName="Torque Data: Client Port" editableOnHmi="true" id="torque_data_port" max="65535" min="1024" value="30003"/>
-        
-        <!-- Impedance Control Parameters -->
+        <processData dataType="java.lang.String" defaultValue="192.170.10.1" displayName="ROS2 PC: IP Address" editableOnHmi="true" id="ros2_pc_ip" value="192.170.1.100"/>
+        <processData dataType="java.lang.Integer" defaultValue="30002" displayName="Trajectory: Server Port" editableOnHmi="true" id="trajectory_server_port" max="65535.0" min="1024.0" value="30002"/>
+        <processData dataType="java.lang.Integer" defaultValue="30003" displayName="Torque Data: Client Port" editableOnHmi="true" id="torque_data_port" max="65535.0" min="1024.0" value="30003"/>
         <processData dataType="java.lang.Double" defaultValue="2000.0" displayName="Stiffness X (N/m)" editableOnHmi="true" id="stiffness_x" max="10000.0" min="100.0" value="2000.0"/>
         <processData dataType="java.lang.Double" defaultValue="2000.0" displayName="Stiffness Y (N/m)" editableOnHmi="true" id="stiffness_y" max="10000.0" min="100.0" value="2000.0"/>
         <processData dataType="java.lang.Double" defaultValue="2000.0" displayName="Stiffness Z (N/m)" editableOnHmi="true" id="stiffness_z" max="10000.0" min="100.0" value="2000.0"/>
         <processData dataType="java.lang.Double" defaultValue="200.0" displayName="Stiffness Rotation (Nm/rad)" editableOnHmi="true" id="stiffness_rot" max="1000.0" min="10.0" value="200.0"/>
         <processData dataType="java.lang.Double" defaultValue="0.7" displayName="Damping Ratio" editableOnHmi="true" id="damping_ratio" max="1.0" min="0.1" value="0.7"/>
-        
-        <!-- Human Interaction Thresholds -->
         <processData dataType="java.lang.Double" defaultValue="10.0" displayName="Force Threshold (N)" editableOnHmi="true" id="force_threshold" max="100.0" min="1.0" value="10.0"/>
         <processData dataType="java.lang.Double" defaultValue="2.0" displayName="Torque Threshold (Nm)" editableOnHmi="true" id="torque_threshold" max="20.0" min="0.1" value="2.0"/>
-        
-        <!-- Control Flags -->
         <processData dataType="java.lang.Boolean" defaultValue="true" displayName="Enable Human Interaction" editableOnHmi="true" id="enable_human_interaction" value="true"/>
         <processData dataType="java.lang.Boolean" defaultValue="true" displayName="Send Torque Data" editableOnHmi="true" id="send_torque_data" value="true"/>
     </processDataContainer>

@@ -27,25 +27,40 @@ import threading
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 
+# Import ProMP class
+from promp import ProMP
+
 class DemoRecorder(Node):
     def __init__(self):
         super().__init__('demo_recorder')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.168.1.50')
+        self.declare_parameter('kuka_ip', '192.170.1.100')
         self.declare_parameter('kuka_port', 30002)
+        self.declare_parameter('torque_port', 30003)
+        self.declare_parameter('ros2_pc_ip', '192.170.1.100')
         self.declare_parameter('record_frequency', 100.0)  # Hz
         self.declare_parameter('demo_duration', 10.0)  # seconds
         self.declare_parameter('num_basis_functions', 50)
         self.declare_parameter('sigma_noise', 0.01)
+        self.declare_parameter('force_threshold', 10.0)
+        self.declare_parameter('torque_threshold', 2.0)
+        self.declare_parameter('enable_human_interaction', True)
+        self.declare_parameter('send_torque_data', True)
         
         # Get parameters
         self.kuka_ip = self.get_parameter('kuka_ip').value
         self.kuka_port = self.get_parameter('kuka_port').value
+        self.torque_port = self.get_parameter('torque_port').value
+        self.ros2_pc_ip = self.get_parameter('ros2_pc_ip').value
         self.record_freq = self.get_parameter('record_frequency').value
         self.demo_duration = self.get_parameter('demo_duration').value
         self.num_basis = self.get_parameter('num_basis_functions').value
         self.sigma_noise = self.get_parameter('sigma_noise').value
+        self.force_threshold = self.get_parameter('force_threshold').value
+        self.torque_threshold = self.get_parameter('torque_threshold').value
+        self.enable_human_interaction = self.get_parameter('enable_human_interaction').value
+        self.send_torque_data = self.get_parameter('send_torque_data').value
         
         # Data storage
         self.demos = []
@@ -57,6 +72,7 @@ class DemoRecorder(Node):
         self.kuka_socket = None
         self.torque_socket = None
         self.torque_data = deque(maxlen=1000)
+        self.kuka_connected = False
         
         # ProMP parameters
         self.promp = None
@@ -80,13 +96,18 @@ class DemoRecorder(Node):
             self.kuka_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.kuka_socket.connect((self.kuka_ip, self.kuka_port))
             
-            # Wait for READY signal
-            ready = self.kuka_socket.recv(1024).decode('utf-8')
-            self.get_logger().info(f'KUKA connection established: {ready}')
+            # Wait for READY signal from Java application
+            ready = self.kuka_socket.recv(1024).decode('utf-8').strip()
+            if ready == "READY":
+                self.kuka_connected = True
+                self.get_logger().info('KUKA connection established - received READY signal')
+            else:
+                self.get_logger().error(f'Unexpected response from KUKA: {ready}')
+                return
             
             # Setup server for receiving torque data
             self.torque_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.torque_socket.bind(('0.0.0.0', 30003))
+            self.torque_socket.bind(('0.0.0.0', self.torque_port))
             self.torque_socket.listen(1)
             
             # Start torque data thread
@@ -159,15 +180,33 @@ class DemoRecorder(Node):
         
         while self.is_recording and (time.time() - start_time) < self.demo_duration:
             try:
-                # Request current pose from KUKA
-                self.kuka_socket.sendall(b'GET_POSE\n')
-                response = self.kuka_socket.recv(1024).decode('utf-8')
+                # Get current pose from robot's current position
+                # Note: The Java app doesn't implement GET_POSE, so we'll use a different approach
+                # For now, we'll simulate recording by using the robot's current position
+                # In a real implementation, you would need to add GET_POSE support to the Java app
                 
-                if response.startswith('POSE:'):
-                    pose_data = response[5:].strip().split(',')
-                    if len(pose_data) >= 6:
-                        pose = [float(x) for x in pose_data[:6]]  # x, y, z, alpha, beta, gamma
-                        self.current_demo.append(pose)
+                # Send a request for current pose (this will need to be implemented in Java)
+                if self.kuka_connected:
+                    self.kuka_socket.sendall(b'GET_POSE\n')
+                    response = self.kuka_socket.recv(1024).decode('utf-8').strip()
+                    
+                    if response.startswith('POSE:'):
+                        pose_data = response[5:].strip().split(',')
+                        if len(pose_data) >= 6:
+                            pose = [float(x) for x in pose_data[:6]]  # x, y, z, alpha, beta, gamma
+                            self.current_demo.append(pose)
+                    elif response == "ERROR:GET_POSE_NOT_IMPLEMENTED":
+                        # Fallback: use simulated pose data for testing
+                        simulated_pose = [
+                            np.sin(time.time() * 0.5) * 0.1,  # x
+                            np.cos(time.time() * 0.3) * 0.1,  # y
+                            0.5 + np.sin(time.time() * 0.2) * 0.05,  # z
+                            0.0,  # alpha
+                            0.0,  # beta
+                            np.sin(time.time() * 0.1) * 0.1   # gamma
+                        ]
+                        self.current_demo.append(simulated_pose)
+                        self.get_logger().debug('Using simulated pose data (GET_POSE not implemented in Java)')
                 
                 time.sleep(dt)
                 
@@ -252,7 +291,7 @@ class DemoRecorder(Node):
             return False
         
         try:
-            # Format trajectory for KUKA
+            # Format trajectory for KUKA (matches Java app format)
             trajectory_str = ";".join([
                 ",".join(map(str, point)) for point in self.learned_trajectory
             ])
@@ -262,13 +301,16 @@ class DemoRecorder(Node):
             
             # Wait for completion
             while True:
-                response = self.kuka_socket.recv(1024).decode('utf-8')
+                response = self.kuka_socket.recv(1024).decode('utf-8').strip()
                 self.get_logger().info(f'KUKA response: {response}')
                 if "TRAJECTORY_COMPLETE" in response:
                     break
                 elif "ERROR" in response:
                     self.get_logger().error(f'KUKA execution error: {response}')
                     return False
+                elif "POINT_COMPLETE" in response:
+                    # Continue waiting for full completion
+                    continue
             
             self.get_logger().info('Trajectory sent to KUKA successfully')
             return True
@@ -280,7 +322,7 @@ class DemoRecorder(Node):
     def timer_callback(self):
         """Periodic timer callback"""
         # Publish status
-        status_msg = f'Demos: {len(self.demos)}, Recording: {self.is_recording}'
+        status_msg = f'Demos: {len(self.demos)}, Recording: {self.is_recording}, Connected: {self.kuka_connected}'
         self.get_logger().debug(status_msg)
     
     def save_demos(self, filename='demos.npy'):

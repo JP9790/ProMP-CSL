@@ -27,7 +27,7 @@ Balancing short&amp; long term adaptation in ProMPs
     source install/setup.bash
 
     # Launch the demo recorder
-    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.168.1.50
+    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.170.1.100
     ```
 # 4. Initial Record 
     ```shell
@@ -114,7 +114,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ros2 run kuka_promp_control demo_recorder
     ros2 run kuka_promp_control control_script
     ros2 run kuka_promp_control train_and_execute --train-only
-    ros2 launch kuka_promp_control deformation_controller.launch.py kuka_ip:=192.168.1.50
+    ros2 launch kuka_promp_control deformation_controller.launch.py kuka_ip:=192.170.1.100
     ros2 topic pub /start_deformation_execution std_msgs/msg/Bool "data: true"
 
 

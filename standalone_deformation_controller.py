@@ -18,7 +18,7 @@ class StandaloneDeformationController(Node):
         super().__init__('standalone_deformation_controller')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.168.1.50')
+        self.declare_parameter('kuka_ip', '192.170.1.100')
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('force_threshold', 10.0)
         self.declare_parameter('torque_threshold', 2.0)
@@ -422,7 +422,7 @@ def main(args=None):
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Standalone Deformation Controller')
-    parser.add_argument('--kuka-ip', default='192.168.1.50', help='KUKA robot IP')
+    parser.add_argument('--kuka-ip', default='192.170.1.100', help='KUKA robot IP')
     parser.add_argument('--trajectory-file', default='learned_trajectory.npy', help='Trajectory file path')
     parser.add_argument('--promp-file', default='promp_model.npy', help='ProMP file path')
     parser.add_argument('--energy-threshold', type=float, default=0.5, help='Energy threshold for conditioning')

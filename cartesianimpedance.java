@@ -188,6 +188,8 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
                     resumeExecution();
                 } else if (trajectoryLine.startsWith("IMPEDANCE:")) {
                     updateImpedanceParameters(trajectoryLine.substring(10));
+                } else if (trajectoryLine.equals("GET_POSE")) {
+                    sendCurrentPose();
                 } else {
                     getLogger().warn("Unknown command: " + trajectoryLine);
                 }
@@ -490,6 +492,25 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
         isExecutingTrajectory.set(true);
         getLogger().info("Execution resumed");
         trajectoryOut.println("RESUMED");
+    }
+    
+    private void sendCurrentPose() {
+        try {
+            // Get current cartesian position
+            Frame currentFrame = robot.getCurrentCartesianPosition(robot.getFlange());
+            
+            // Format: POSE:x,y,z,alpha,beta,gamma
+            String poseResponse = String.format("POSE:%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                currentFrame.getX(), currentFrame.getY(), currentFrame.getZ(),
+                currentFrame.getAlphaRad(), currentFrame.getBetaRad(), currentFrame.getGammaRad());
+            
+            trajectoryOut.println(poseResponse);
+            getLogger().info("Sent current pose: " + poseResponse);
+            
+        } catch (Exception e) {
+            getLogger().error("Error sending current pose: " + e.getMessage());
+            trajectoryOut.println("ERROR:POSE_RETRIEVAL_FAILED");
+        }
     }
     
     private void updateImpedanceParameters(String parameters) {
