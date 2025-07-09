@@ -138,7 +138,7 @@ Balancing short&amp; long term adaptation in ProMPs
     source install/setup.bash
 
     # Launch the demo recorder
-    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=172.31.1.25
+    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.170.10.25
     ```
 
 # 8. Initial Record 
@@ -259,29 +259,29 @@ Balancing short&amp; long term adaptation in ProMPs
 ## 13.1. Network Connection Issues:
     ```
     # Test network connectivity to KUKA robot
-    ping 172.31.1.25
+    ping 192.170.10.25
     
     # Test port connectivity
-    nc -zv 172.31.1.25 30002
-    telnet 172.31.1.25 30002
+    nc -zv 192.170.10.25 30002
+    telnet 192.170.10.25 30002
     
     # Check your network configuration
     ip addr show
     ip route show
     
-    # Network Configuration:
-    # KUKA Robot IP: 172.31.1.25 (where Java app runs)
-    # ROS2 PC IP: 192.170.10.1 (where Python runs)
-    # Communication: Python → KUKA (172.31.1.25:30002), KUKA → Python (192.170.10.1:30003)
+    # Simplified Network Configuration (Same Network):
+    # KUKA Robot IP: 192.170.10.25 (same network as PC)
+    # ROS2 PC IP: 192.170.10.1 (your PC)
+    # Communication: Both on 192.170.10.x network
     
     # Launch with the correct IP address:
-    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=172.31.1.25
+    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.170.10.25
     ```
 
 # 14. Work Flow
     ```
     # Terminal 1: Start demo recorder
-    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=172.31.1.25
+    ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.170.10.25
     
     # Terminal 2: Run control script for automatic recording
     ros2 run kuka_promp_control control_script
@@ -290,7 +290,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ros2 run kuka_promp_control train_and_execute --train-only --visualize
     
     # Terminal 4: Start deformation controller
-    ros2 launch kuka_promp_control deformation_controller.launch.py kuka_ip:=172.31.1.25
+    ros2 launch kuka_promp_control deformation_controller.launch.py kuka_ip:=192.170.10.25
     
     # Terminal 5: Start deformation execution
     ros2 topic pub /start_deformation_execution std_msgs/msg/Bool "data: true"

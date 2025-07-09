@@ -7,7 +7,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'kuka_ip',
-            default_value='172.31.1.25',  # KUKA robot IP
+            default_value='192.170.10.25',  # KUKA robot IP (same network as PC)
             description='IP address of KUKA robot'
         ),
         

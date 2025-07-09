@@ -38,7 +38,7 @@ class DemoRecorder(Node):
         super().__init__('demo_recorder')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '172.31.1.25')
+        self.declare_parameter('kuka_ip', '192.170.10.25')
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('torque_port', 30003)
         self.declare_parameter('ros2_pc_ip', '192.170.10.1')
