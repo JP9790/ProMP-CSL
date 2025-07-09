@@ -90,19 +90,24 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 # 5. Copy Python files:
-    ```shell
-    # Copy all Python files to kuka_promp_control/ directory
-    cp demo_recorder.py kuka_promp_control/
-    cp control_script.py kuka_promp_control/
-    cp train_and_execute.py kuka_promp_control/
-    cp standalone_deformation_controller.py kuka_promp_control/
-    cp promp.py kuka_promp_control/
-    cp trajectory_deformer.py kuka_promp_control/
-    cp stepwise_em_learner.py kuka_promp_control/
+    ```
+    # Assuming Python files are in ~/Downloads and package is in ~/kuka_promp_control
+    # Copy all Python files to kuka_promp_control/kuka_promp_control/ directory
+    cp ~/Downloads/demo_recorder.py ~/kuka_promp_control/kuka_promp_control/
+    cp ~/Downloads/control_script.py ~/kuka_promp_control/kuka_promp_control/
+    cp ~/Downloads/train_and_execute.py ~/kuka_promp_control/kuka_promp_control/
+    cp ~/Downloads/standalone_deformation_controller.py ~/kuka_promp_control/kuka_promp_control/
+    cp ~/Downloads/promp.py ~/kuka_promp_control/kuka_promp_control/
+    cp ~/Downloads/trajectory_deformer.py ~/kuka_promp_control/kuka_promp_control/
+    cp ~/Downloads/stepwise_em_learner.py ~/kuka_promp_control/kuka_promp_control/
     
     # Copy launch files
-    cp demo_recorder.launch.py launch/
-    cp deformation_controller.launch.py launch/
+    cp ~/Downloads/demo_recorder.launch.py ~/kuka_promp_control/launch/
+    cp ~/Downloads/deformation_controller.launch.py ~/kuka_promp_control/launch/
+    
+    # Alternative: If you want to copy all .py files at once
+    # cp ~/Downloads/*.py ~/kuka_promp_control/kuka_promp_control/
+    # cp ~/Downloads/*.launch.py ~/kuka_promp_control/launch/
     ```
 
 # 6. Install Python dependencies:
