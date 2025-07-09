@@ -77,7 +77,9 @@ Balancing short&amp; long term adaptation in ProMPs
         maintainer_email='your_email@example.com',
         description='ProMP-CSL: Balancing short & long term adaptation in ProMPs',
         license='MIT',
-        tests_require=['pytest'],
+        extras_require={
+            'test': ['pytest'],
+        },
         entry_points={
             'console_scripts': [
                 'demo_recorder = kuka_promp_control.demo_recorder:main',
