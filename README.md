@@ -1,12 +1,12 @@
 # ProMP-CSL
 Balancing short&amp; long term adaptation in ProMPs
 # Usage
-1. Create package:
+# 1. Create package:
     ```shell
     ros2 pkg create --build-type ament_python kuka_promp_control
     cd kuka_promp_control
     ```
-2. Add package dependencies:
+# 2. Add package dependencies:
     ```shell
     <depend>rclpy</depend>
     <depend>geometry_msgs</depend>
@@ -18,7 +18,7 @@ Balancing short&amp; long term adaptation in ProMPs
     <depend>scipy</depend>
     <depend>matplotlib</depend>
     ```
-3. Build and Run
+# 3. Build and Run
     ```shell
     # Build the package
     colcon build --packages-select kuka_promp_control
@@ -29,12 +29,12 @@ Balancing short&amp; long term adaptation in ProMPs
     # Launch the demo recorder
     ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.168.1.50
     ```
-4. Initial Record 
+# 4. Initial Record 
     ```shell
     # In another terminal, run the control script
     ros2 run kuka_promp_control control_script
     ```
-5. Manual Record
+# 5. Manual Record
     ```shell
     # Start recording
     ros2 topic pub /start_recording std_msgs/msg/Bool "data: true"
@@ -42,9 +42,9 @@ Balancing short&amp; long term adaptation in ProMPs
     # Stop recording
     ros2 topic pub /start_recording std_msgs/msg/Bool "data: false"
     ```
-6. Train ProMP
+# 6. Train ProMP
 
-6.1. Update `setup.py` to include the new script
+## 6.1. Update `setup.py` to include the new script
     ```shell    
     entry_points={
         'console_scripts': [
@@ -55,7 +55,7 @@ Balancing short&amp; long term adaptation in ProMPs
         ],
     },      
     ```
-6.2. Execution
+## 6.2. Execution
 - Complete Pipeline
     ```shell
     ros2 run kuka_promp_control train_and_execute
@@ -72,8 +72,8 @@ Balancing short&amp; long term adaptation in ProMPs
     ```shell
     ros2 run kuka_promp_control train_and_execute --load-trajectory my_trajectory.npy--visualize
     ```
-7. Deformation:
-7.1 Basic Usage (with default parameters)
+# 7. Deformation:
+## 7.1 Basic Usage (with default parameters)
     ```shell
     # Build the package
     colcon build --packages-select kuka_promp_control
@@ -84,7 +84,7 @@ Balancing short&amp; long term adaptation in ProMPs
     # Launch with default parameters
     ros2 launch kuka_promp_control deformation_controller.launch.py
     ```
-7.2 Custom Deformation Parameters
+## 7.2 Custom Deformation Parameters
     ```shell
     ros2 launch kuka_promp_control deformation_controller.launch.py \
         energy_threshold:=0.3 \
@@ -92,14 +92,14 @@ Balancing short&amp; long term adaptation in ProMPs
         torque_threshold:=1.5 \
         deformation_alpha:=0.15
     ```
-7.3 Custom EM Learning Parameters
+## 7.3 Custom EM Learning Parameters
     ```shell
     ros2 launch kuka_promp_control deformation_controller.launch.py \
         em_learning_rate:=0.2 \
         em_convergence_tolerance:=1e-5 \
         em_min_iterations:=10
     ```
-7.3 Monitor Status:
+## 7.3 Monitor Status:
     ```shell
     # Monitor all status topics
     ros2 topic echo /deformation_status
@@ -109,7 +109,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ros2 topic echo /deformation_statistics
     ```
 
-8. Work Flow
+# 8. Work Flow
     ```shell
     ros2 run kuka_promp_control demo_recorder
     ros2 run kuka_promp_control control_script
