@@ -10,15 +10,15 @@ import threading
 from collections import deque
 import json
 import argparse
-from trajectory_deformer import TrajectoryDeformer
-from promp import ProMP
+from .trajectory_deformer import TrajectoryDeformer
+from .promp import ProMP
 
 class StandaloneDeformationController(Node):
     def __init__(self):
         super().__init__('standalone_deformation_controller')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.170.1.100')
+        self.declare_parameter('kuka_ip', '172.31.1.25')
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('force_threshold', 10.0)
         self.declare_parameter('torque_threshold', 2.0)
@@ -422,7 +422,7 @@ def main(args=None):
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Standalone Deformation Controller')
-    parser.add_argument('--kuka-ip', default='192.170.1.100', help='KUKA robot IP')
+    parser.add_argument('--kuka-ip', default='172.31.1.25', help='KUKA robot IP')
     parser.add_argument('--trajectory-file', default='learned_trajectory.npy', help='Trajectory file path')
     parser.add_argument('--promp-file', default='promp_model.npy', help='ProMP file path')
     parser.add_argument('--energy-threshold', type=float, default=0.5, help='Energy threshold for conditioning')

@@ -28,17 +28,20 @@ from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 
 # Import ProMP class
-from promp import ProMP
+try:
+    from .promp import ProMP
+except ImportError:
+    from promp import ProMP
 
 class DemoRecorder(Node):
     def __init__(self):
         super().__init__('demo_recorder')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.170.1.100')
+        self.declare_parameter('kuka_ip', '172.31.1.25')
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('torque_port', 30003)
-        self.declare_parameter('ros2_pc_ip', '192.170.1.100')
+        self.declare_parameter('ros2_pc_ip', '192.170.10.1')
         self.declare_parameter('record_frequency', 100.0)  # Hz
         self.declare_parameter('demo_duration', 10.0)  # seconds
         self.declare_parameter('num_basis_functions', 50)

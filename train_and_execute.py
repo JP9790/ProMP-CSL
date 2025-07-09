@@ -7,7 +7,7 @@ import numpy as np
 import socket
 import time
 import matplotlib.pyplot as plt
-from promp import ProMP
+from .promp import ProMP
 import argparse
 
 class TrainAndExecute(Node):
@@ -15,7 +15,7 @@ class TrainAndExecute(Node):
         super().__init__('train_and_execute')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.170.1.100')
+        self.declare_parameter('kuka_ip', '172.31.1.25')
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('num_basis_functions', 50)
         self.declare_parameter('sigma_noise', 0.01)
@@ -259,7 +259,7 @@ def main(args=None):
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train ProMP and execute trajectory')
     parser.add_argument('--demo-file', default='demos.npy', help='Demo file path')
-    parser.add_argument('--kuka-ip', default='192.170.1.100', help='KUKA robot IP')
+    parser.add_argument('--kuka-ip', default='172.31.1.25', help='KUKA robot IP')
     parser.add_argument('--train-only', action='store_true', help='Only train ProMP, do not execute')
     parser.add_argument('--execute-only', action='store_true', help='Only execute, do not train')
     parser.add_argument('--visualize', action='store_true', help='Show trajectory visualization')
