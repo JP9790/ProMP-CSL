@@ -9,6 +9,8 @@ class ProMP:
         self.weights = None
         self.basis_centers = None
         self.basis_width = None
+        self.mean_weights = None
+        self.cov_weights = None
         
     def _generate_basis_functions(self, t):
         """Generate RBF basis functions"""
@@ -52,7 +54,7 @@ class ProMP:
         # Add noise to covariance
         self.cov_weights += self.sigma_noise * np.eye(self.cov_weights.shape[0])
         
-        self.get_logger().info(f'ProMP trained on {len(demonstrations)} demonstrations')
+        print(f'ProMP trained on {len(demonstrations)} demonstrations')
     
     def generate_trajectory(self, num_points=100):
         """Generate trajectory from learned ProMP"""
@@ -71,7 +73,14 @@ class ProMP:
         return trajectory
     
     def condition_on_waypoint(self, t_condition, y_condition, sigma_condition=0.01):
-        """Condition ProMP on a waypoint"""
+        """
+        Condition ProMP on a waypoint
+        
+        Args:
+            t_condition: Time point (0-1) where conditioning occurs
+            y_condition: Desired position at conditioning point
+            sigma_condition: Uncertainty of conditioning point
+        """
         if self.mean_weights is None:
             raise ValueError("ProMP not trained yet")
         
@@ -86,3 +95,25 @@ class ProMP:
         # Update mean and covariance
         self.mean_weights = self.mean_weights + K @ (y_condition - basis_condition @ self.mean_weights)
         self.cov_weights = self.cov_weights - K @ basis_condition @ self.cov_weights
+        
+        print(f'ProMP conditioned on waypoint at t={t_condition:.3f}')
+    
+    def condition_on_multiple_waypoints(self, t_conditions, y_conditions, sigma_condition=0.01):
+        """
+        Condition ProMP on multiple waypoints
+        
+        Args:
+            t_conditions: List of time points (0-1)
+            y_conditions: List of desired positions
+            sigma_condition: Uncertainty of conditioning points
+        """
+        if self.mean_weights is None:
+            raise ValueError("ProMP not trained yet")
+        
+        for t_cond, y_cond in zip(t_conditions, y_conditions):
+            self.condition_on_waypoint(t_cond, y_cond, sigma_condition)
+    
+    def get_logger(self):
+        """Get logger for compatibility"""
+        import logging
+        return logging.getLogger(__name__)
