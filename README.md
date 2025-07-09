@@ -43,6 +43,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ros2 topic pub /start_recording std_msgs/msg/Bool "data: false"
     ```
 6. Train ProMP
+
 6.1. Update `setup.py` to include the new script
     ```shell    
     entry_points={
