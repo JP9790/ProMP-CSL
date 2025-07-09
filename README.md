@@ -4,13 +4,13 @@ Balancing short&amp; long term adaptation in ProMPs
 # Usage
 
 # 1. Create package:
-    ```shell
+    ```
     ros2 pkg create --build-type ament_python kuka_promp_control
     cd kuka_promp_control
     ```
 
 # 2. Setup package structure:
-    ```shell
+    ```
     # Create required directories
     mkdir -p kuka_promp_control
     mkdir -p launch
@@ -106,12 +106,12 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 # 6. Install Python dependencies:
-    ```shell
+    ```
     pip3 install numpy scipy matplotlib
     ```
 
 # 7. Build and Run
-    ```shell
+    ```
     # Build the package
     colcon build --packages-select kuka_promp_control
 
@@ -123,13 +123,13 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 # 8. Initial Record 
-    ```shell
+    ```
     # In another terminal, run the control script
     ros2 run kuka_promp_control control_script
     ```
 
 # 9. Manual Record
-    ```shell
+    ```
     # Start recording
     ros2 topic pub /start_recording std_msgs/msg/Bool "data: true"
 
@@ -138,7 +138,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 # 10. Check Recording Status
-    ```shell
+    ```
     # Monitor recording status
     ros2 topic echo /demo_status
     
@@ -150,25 +150,25 @@ Balancing short&amp; long term adaptation in ProMPs
 
 ## 11.1. Execution
 - Complete Pipeline
-    ```shell
+    ```
     ros2 run kuka_promp_control train_and_execute
     ```
 - Train Only (with visualization)
-    ```shell
+    ```
     ros2 run kuka_promp_control train_and_execute --train-only --visualize
     ```
 - Execute Only (load pre-trained trajectory)
-    ```shell
+    ```
     ros2 run kuka_promp_control train_and_execute --execute-only
     ```
 - Load Specific Trajectory File
-    ```shell
+    ```
     ros2 run kuka_promp_control train_and_execute --load-trajectory my_trajectory.npy --visualize
     ```
 
 # 12. Deformation:
 ## 12.1 Basic Usage (with default parameters)
-    ```shell
+    ```
     # Build the package
     colcon build --packages-select kuka_promp_control
 
@@ -180,7 +180,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 ## 12.2 Custom Deformation Parameters
-    ```shell
+    ```
     ros2 launch kuka_promp_control deformation_controller.launch.py \
         energy_threshold:=0.3 \
         force_threshold:=8.0 \
@@ -189,7 +189,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 ## 12.3 Custom EM Learning Parameters
-    ```shell
+    ```
     ros2 launch kuka_promp_control deformation_controller.launch.py \
         em_learning_rate:=0.2 \
         em_convergence_tolerance:=1e-5 \
@@ -197,7 +197,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 ## 12.4 Monitor Status:
-    ```shell
+    ```
     # Monitor all status topics
     ros2 topic echo /deformation_status
     ros2 topic echo /deformation_energy
@@ -207,7 +207,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 ## 12.5 Control Deformation Execution:
-    ```shell
+    ```
     # Start deformation execution
     ros2 topic pub /start_deformation_execution std_msgs/msg/Bool "data: true"
     
@@ -219,7 +219,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 # 13. Troubleshooting:
-    ```shell
+    ```
     # Check if package is built correctly
     ros2 pkg list | grep kuka_promp_control
     
@@ -238,7 +238,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 # 14. Work Flow
-    ```shell
+    ```
     # Terminal 1: Start demo recorder
     ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.170.1.100
     
@@ -256,7 +256,7 @@ Balancing short&amp; long term adaptation in ProMPs
     ```
 
 # 15. Java Application Setup:
-    ```shell
+    ```
     # Copy Java files to KUKA Sunrise Workbench project
     # 1. Create new KUKA Sunrise Project
     # 2. Copy cartesianimpedance.java to src/application/
