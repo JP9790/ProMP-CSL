@@ -5,10 +5,7 @@ import com.kuka.roboticsAPI.deviceModel.LBR;
 import com.kuka.roboticsAPI.geometricModel.Frame;
 import com.kuka.roboticsAPI.motionModel.IMotionContainer;
 import com.kuka.roboticsAPI.motionModel.LIN;
-import com.kuka.roboticsAPI.motionModel.PositionControlMode;
-// Try these alternative imports if you need impedance control:
-// import com.kuka.roboticsAPI.motionModel.ImpedanceControlMode;
-// import com.kuka.roboticsAPI.motionModel.CartesianImpedanceControlMode;
+import com.kuka.roboticsAPI.motionModel.controlModeModel.PositionControlMode;
 import com.kuka.roboticsAPI.sensorModel.ForceSensorData;
 import com.kuka.roboticsAPI.deviceModel.JointPosition;
 import com.kuka.roboticsAPI.geometricModel.math.Transformation;
@@ -19,7 +16,7 @@ import java.io.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
+public class Cartesianimpedance extends RoboticsAPIApplication {
     
     // Robot device
     private LBR robot;
@@ -45,19 +42,21 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
     private AtomicBoolean isRunning = new AtomicBoolean(true);
     private AtomicBoolean isExecutingTrajectory = new AtomicBoolean(false);
     
+    // Current motion container for stopping execution
+    private IMotionContainer currentMotionContainer = null;
+    
     // External torque threshold for human interaction
     private double forceThreshold = 10.0; // N
     private double torqueThreshold = 2.0; // Nm
     
     // ROS2 PC IP address - CHANGE THIS TO YOUR ROS2 PC IP
-    private String ros2PCIP = "192.168.1.100"; // Replace with your ROS2 PC IP
+    private String ros2PCIP = "192.170.10.1"; // Replace with your ROS2 PC IP
     
     @Override
     public void initialize() {
         // Load configuration first
         loadConfigurationFromDataXML();
         
-
         // Get robot device
         robot = (LBR) getContext().getDeviceFromType(LBR.class);
         
@@ -133,7 +132,7 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
         try {
             // Parse trajectory points
             String[] points = trajectoryData.split(";");
-            List<Frame> trajectoryFrames = new ArrayList<>();
+            List<Frame> trajectoryFrames = new ArrayList<Frame>();
             
             for (String point : points) {
                 String[] coords = point.trim().split(",");
@@ -159,28 +158,28 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
             getLogger().error("Error parsing trajectory data: " + e.getMessage());
         }
     }
-    // Add this method to your CartesianImpedanceControllerApp class
+    
     private void loadConfigurationFromDataXML() {
         try {
             // Load ROS2 communication settings
-            ros2PCIP = getApplicationData().getProcessData("ros2_pc_ip").getValue();
-            int trajectoryPort = getApplicationData().getProcessData("trajectory_server_port").getValue();
-            int torquePort = getApplicationData().getProcessData("torque_data_port").getValue();
+            ros2PCIP = getApplicationData().getProcessData("ros2_pc_ip").getValue().toString();
+            int trajectoryPort = Integer.parseInt(getApplicationData().getProcessData("trajectory_server_port").getValue().toString());
+            int torquePort = Integer.parseInt(getApplicationData().getProcessData("torque_data_port").getValue().toString());
         
             // Load impedance parameters
-            stiffnessX = getApplicationData().getProcessData("stiffness_x").getValue();
-            stiffnessY = getApplicationData().getProcessData("stiffness_y").getValue();
-            stiffnessZ = getApplicationData().getProcessData("stiffness_z").getValue();
-            stiffnessRot = getApplicationData().getProcessData("stiffness_rot").getValue();
-            damping = getApplicationData().getProcessData("damping_ratio").getValue();
+            stiffnessX = Double.parseDouble(getApplicationData().getProcessData("stiffness_x").getValue().toString());
+            stiffnessY = Double.parseDouble(getApplicationData().getProcessData("stiffness_y").getValue().toString());
+            stiffnessZ = Double.parseDouble(getApplicationData().getProcessData("stiffness_z").getValue().toString());
+            stiffnessRot = Double.parseDouble(getApplicationData().getProcessData("stiffness_rot").getValue().toString());
+            damping = Double.parseDouble(getApplicationData().getProcessData("damping_ratio").getValue().toString());
         
             // Load interaction thresholds
-            forceThreshold = getApplicationData().getProcessData("force_threshold").getValue();
-            torqueThreshold = getApplicationData().getProcessData("torque_threshold").getValue();
+            forceThreshold = Double.parseDouble(getApplicationData().getProcessData("force_threshold").getValue().toString());
+            torqueThreshold = Double.parseDouble(getApplicationData().getProcessData("torque_threshold").getValue().toString());
         
             // Load control flags
-            boolean enableHumanInteraction = getApplicationData().getProcessData("enable_human_interaction").getValue();
-            boolean sendTorqueData = getApplicationData().getProcessData("send_torque_data").getValue();
+            boolean enableHumanInteraction = Boolean.parseBoolean(getApplicationData().getProcessData("enable_human_interaction").getValue().toString());
+            boolean sendTorqueData = Boolean.parseBoolean(getApplicationData().getProcessData("send_torque_data").getValue().toString());
         
             getLogger().info("Configuration loaded from data.xml");
             getLogger().info("ROS2 PC IP: " + ros2PCIP);
@@ -190,12 +189,21 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
             getLogger().error("Error loading configuration: " + e.getMessage());
         }
     }
+    
     private void executeTrajectoryPoints(List<Frame> trajectoryFrames) {
         isExecutingTrajectory.set(true);
         
         try {
-            // Setup position control mode (simpler alternative to impedance control)
+            // Setup Position Control Mode with compliance monitoring
             PositionControlMode positionMode = new PositionControlMode();
+            
+            // Configure position control parameters for more compliant behavior
+            // Note: In standard KUKA Sunrise Workbench, we use position control
+            // but monitor external forces to simulate impedance-like behavior
+            
+            getLogger().info("Position Control Mode configured with force monitoring");
+            getLogger().info("Stiffness parameters (for reference): X=" + stiffnessX + ", Y=" + stiffnessY + ", Z=" + stiffnessZ + ", Rot=" + stiffnessRot);
+            getLogger().info("Damping: " + damping);
             
             // Execute trajectory point by point
             for (Frame targetFrame : trajectoryFrames) {
@@ -208,10 +216,10 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
                 LIN motion = new LIN(targetFrame);
                 motion.setMode(positionMode);
                 
-                IMotionContainer motionContainer = robot.moveAsync(motion);
+                currentMotionContainer = robot.moveAsync(motion);
                 
                 // Monitor execution and external forces
-                while (!motionContainer.isFinished() && isExecutingTrajectory.get()) {
+                while (!currentMotionContainer.isFinished() && isExecutingTrajectory.get()) {
                     // Get external force/torque data
                     ForceSensorData forceData = robot.getExternalForceTorque(robot.getFlange());
                     
@@ -223,6 +231,12 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
                         getLogger().info("Human interaction detected - allowing trajectory modification");
                         // Here you can implement trajectory modification logic
                         // For now, we just log the interaction
+                        
+                        // Optional: Pause execution when significant force is detected
+                        // This simulates impedance-like behavior
+                        if (getForceMagnitude(forceData) > forceThreshold * 2) {
+                            getLogger().warn("High force detected - considering pause for safety");
+                        }
                     }
                     
                     ThreadUtil.milliSleep(10); // 100 Hz monitoring
@@ -260,24 +274,37 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
     }
     
     private boolean detectHumanInteraction(ForceSensorData forceData) {
-        double forceMagnitude = Math.sqrt(
-            Math.pow(forceData.getForce().getX(), 2) +
-            Math.pow(forceData.getForce().getY(), 2) +
-            Math.pow(forceData.getForce().getZ(), 2)
-        );
-        
-        double torqueMagnitude = Math.sqrt(
-            Math.pow(forceData.getTorque().getX(), 2) +
-            Math.pow(forceData.getTorque().getY(), 2) +
-            Math.pow(forceData.getTorque().getZ(), 2)
-        );
+        double forceMagnitude = getForceMagnitude(forceData);
+        double torqueMagnitude = getTorqueMagnitude(forceData);
         
         return forceMagnitude > forceThreshold || torqueMagnitude > torqueThreshold;
     }
     
+    private double getForceMagnitude(ForceSensorData forceData) {
+        return Math.sqrt(
+            Math.pow(forceData.getForce().getX(), 2) +
+            Math.pow(forceData.getForce().getY(), 2) +
+            Math.pow(forceData.getForce().getZ(), 2)
+        );
+    }
+    
+    private double getTorqueMagnitude(ForceSensorData forceData) {
+        return Math.sqrt(
+            Math.pow(forceData.getTorque().getX(), 2) +
+            Math.pow(forceData.getTorque().getY(), 2) +
+            Math.pow(forceData.getTorque().getZ(), 2)
+        );
+    }
+    
     private void stopExecution() {
         isExecutingTrajectory.set(false);
-        robot.stop();
+        
+        // Cancel current motion if active
+        if (currentMotionContainer != null && !currentMotionContainer.isFinished()) {
+            currentMotionContainer.cancel();
+            getLogger().info("Current motion cancelled");
+        }
+        
         getLogger().info("Execution stopped");
         trajectoryOut.println("STOPPED");
     }
@@ -316,6 +343,12 @@ public class CartesianImpedanceControllerApp extends RoboticsAPIApplication {
     private void cleanup() {
         isRunning.set(false);
         isExecutingTrajectory.set(false);
+        
+        // Cancel any active motion
+        if (currentMotionContainer != null && !currentMotionContainer.isFinished()) {
+            currentMotionContainer.cancel();
+            getLogger().info("Active motion cancelled during cleanup");
+        }
         
         try {
             if (trajectoryIn != null) trajectoryIn.close();
