@@ -6,10 +6,13 @@ import com.kuka.roboticsAPI.geometricModel.Frame;
 import com.kuka.roboticsAPI.motionModel.IMotionContainer;
 import com.kuka.roboticsAPI.motionModel.LIN;
 import com.kuka.roboticsAPI.motionModel.controlModeModel.PositionControlMode;
+import com.kuka.roboticsAPI.motionModel.controlModeModel.JointImpedanceControlMode;
+import com.kuka.roboticsAPI.motionModel.PositionHold;
 import com.kuka.roboticsAPI.sensorModel.ForceSensorData;
 import com.kuka.roboticsAPI.deviceModel.JointPosition;
 import com.kuka.roboticsAPI.geometricModel.math.Transformation;
 import com.kuka.common.ThreadUtil;
+import static com.kuka.roboticsAPI.motionModel.BasicMotions.*;
 
 import java.net.*;
 import java.io.*;
@@ -32,10 +35,10 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
     private PrintWriter torqueDataOut;
     
     // Control parameters
-    private double stiffnessX = 2000.0; // N/m
-    private double stiffnessY = 2000.0;
-    private double stiffnessZ = 2000.0;
-    private double stiffnessRot = 200.0; // Nm/rad
+    private double stiffnessX = 50.0; // N/m
+    private double stiffnessY = 50.0;
+    private double stiffnessZ = 50.0;
+    private double stiffnessRot = 20.0; // Nm/rad
     private double damping = 0.7; // Damping ratio
     
     // Control flags
@@ -52,46 +55,115 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
     // ROS2 PC IP address - CHANGE THIS TO YOUR ROS2 PC IP
     private String ros2PCIP = "192.170.10.1"; // Replace with your ROS2 PC IP
     
+    // Initial position for the robot
+    private static final JointPosition INITIAL_POSITION = new JointPosition(0.0, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0);
+    
+    // Position hold for compliant waiting
+    private PositionHold positionHold;
+    
     @Override
     public void initialize() {
+        getLogger().info("=== INITIALIZATION START ===");
+        
         // Load configuration first
         loadConfigurationFromDataXML();
         
         // Get robot device
         robot = (LBR) getContext().getDeviceFromType(LBR.class);
         
+        // DIAGNOSTIC CHECK 1: Robot device status
+        if (robot == null) {
+            getLogger().error("DIAGNOSTIC ERROR: Robot device is NULL!");
+            return;
+        }
+        
+        getLogger().info("DIAGNOSTIC CHECK 1: Robot device acquired successfully");
+        getLogger().info("Robot name: " + robot.getName());
+        getLogger().info("Robot ready to move: " + robot.isReadyToMove());
+        getLogger().info("Robot has active motion command: " + robot.hasActiveMotionCommand());
+        
         getLogger().info("Initializing Cartesian Impedance Controller...");
         
         // Setup server socket for receiving trajectory commands
         try {
             trajectoryServerSocket = new ServerSocket(30002);
-            getLogger().info("Trajectory server started on port 30002");
+            getLogger().info("DIAGNOSTIC CHECK 2: Trajectory server started on port 30002");
         } catch (IOException e) {
-            getLogger().error("Could not start trajectory server socket: " + e.getMessage());
+            getLogger().error("DIAGNOSTIC ERROR: Could not start trajectory server socket: " + e.getMessage());
         }
         
         // Setup client socket for sending torque data
         try {
             torqueDataSocket = new Socket(ros2PCIP, 30003);
             torqueDataOut = new PrintWriter(torqueDataSocket.getOutputStream(), true);
-            getLogger().info("Connected to ROS2 PC for torque data transmission");
+            getLogger().info("DIAGNOSTIC CHECK 3: Connected to ROS2 PC for torque data transmission");
         } catch (IOException e) {
-            getLogger().error("Could not connect to ROS2 PC for torque data: " + e.getMessage());
+            getLogger().error("DIAGNOSTIC ERROR: Could not connect to ROS2 PC for torque data: " + e.getMessage());
         }
+        
+        getLogger().info("=== INITIALIZATION COMPLETE ===");
     }
 
     @Override
     public void run() {
+        getLogger().info("=== RUN METHOD START ===");
         getLogger().info("Starting Cartesian Impedance Controller...");
         
+        // DIAGNOSTIC CHECK 4: Robot status before initial motion
+        getLogger().info("DIAGNOSTIC CHECK 4: Robot status before initial motion");
+        getLogger().info("Robot ready to move: " + robot.isReadyToMove());
+        getLogger().info("Robot has active motion command: " + robot.hasActiveMotionCommand());
+        getLogger().info("Current joint position: " + robot.getCurrentJointPosition());
+        
+        // DIAGNOSTIC TEST: Run basic robot functionality test
+        testRobotFunctionality();
+        
+        // Move to initial position first
+        getLogger().info("DIAGNOSTIC CHECK 5: Attempting to move to initial position...");
         try {
-            // Wait for ROS2 connection
-            getLogger().info("Waiting for ROS2 trajectory connection...");
+            robot.move(ptp(INITIAL_POSITION).setJointVelocityRel(0.2));
+            getLogger().info("DIAGNOSTIC CHECK 5: Initial position motion completed successfully");
+        } catch (Exception e) {
+            getLogger().error("DIAGNOSTIC ERROR: Failed to move to initial position: " + e.getMessage());
+            e.printStackTrace();
+        }
+        
+        // Setup PositionHold with impedance control for compliant waiting
+        getLogger().info("DIAGNOSTIC CHECK 6: Setting up PositionHold with impedance control...");
+        try {
+            JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            impedanceMode.setStiffnessForAllJoints(0.0); // Very low stiffness for compliance
+            getLogger().info("DIAGNOSTIC CHECK 6: JointImpedanceControlMode created successfully");
+            
+            positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
+            getLogger().info("DIAGNOSTIC CHECK 6: PositionHold created successfully");
+            
+            // Start PositionHold to keep robot compliant while waiting
+            getLogger().info("DIAGNOSTIC CHECK 7: Starting PositionHold - robot should now be compliant");
+            currentMotionContainer = robot.moveAsync(positionHold);
+            getLogger().info("DIAGNOSTIC CHECK 7: PositionHold started successfully");
+            getLogger().info("PositionHold motion container: " + (currentMotionContainer != null ? "Created" : "NULL"));
+            
+        } catch (Exception e) {
+            getLogger().error("DIAGNOSTIC ERROR: Failed to setup PositionHold: " + e.getMessage());
+            e.printStackTrace();
+        }
+        
+        try {
+            // DIAGNOSTIC CHECK 8: Robot status after PositionHold setup
+            getLogger().info("DIAGNOSTIC CHECK 8: Robot status after PositionHold setup");
+            getLogger().info("Robot ready to move: " + robot.isReadyToMove());
+            getLogger().info("Robot has active motion command: " + robot.hasActiveMotionCommand());
+            getLogger().info("Current joint position: " + robot.getCurrentJointPosition());
+            
+            // Wait for ROS2 connection with timeout
+            getLogger().info("DIAGNOSTIC CHECK 9: Waiting for ROS2 trajectory connection (timeout: 30 seconds)...");
+            trajectoryServerSocket.setSoTimeout(30000); // 30 second timeout
             trajectoryClientSocket = trajectoryServerSocket.accept();
             trajectoryIn = new BufferedReader(new InputStreamReader(trajectoryClientSocket.getInputStream()));
             trajectoryOut = new PrintWriter(trajectoryClientSocket.getOutputStream(), true);
             
-            getLogger().info("ROS2 trajectory client connected from: " + trajectoryClientSocket.getInetAddress());
+            getLogger().info("DIAGNOSTIC CHECK 9: ROS2 trajectory client connected from: " + trajectoryClientSocket.getInetAddress());
             
             // Send ready signal
             trajectoryOut.println("READY");
@@ -122,8 +194,21 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
             }
             
         } catch (IOException e) {
-            getLogger().error("IO Exception in main loop: " + e.getMessage());
+            getLogger().error("DIAGNOSTIC ERROR: IO Exception in main loop: " + e.getMessage());
+            getLogger().info("DIAGNOSTIC CHECK 10: Continuing with PositionHold for manual operation");
+            
+            // DIAGNOSTIC CHECK 11: Robot status during manual operation mode
+            getLogger().info("DIAGNOSTIC CHECK 11: Robot status during manual operation mode");
+            getLogger().info("Robot ready to move: " + robot.isReadyToMove());
+            getLogger().info("Robot has active motion command: " + robot.hasActiveMotionCommand());
+            getLogger().info("PositionHold active: " + (currentMotionContainer != null && !currentMotionContainer.isFinished()));
+            
+            // Keep PositionHold active for manual operation
+            while (isRunning.get()) {
+                ThreadUtil.milliSleep(1000); // Check every second
+            }
         } finally {
+            getLogger().info("=== RUN METHOD ENDING - CLEANUP STARTING ===");
             cleanup();
         }
     }
@@ -159,6 +244,51 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
         }
     }
     
+    // DIAGNOSTIC METHOD: Test basic robot functionality
+    private void testRobotFunctionality() {
+        getLogger().info("=== ROBOT FUNCTIONALITY TEST ===");
+        
+        try {
+            // Test 1: Check robot status
+            getLogger().info("TEST 1: Robot status check");
+            getLogger().info("Robot name: " + robot.getName());
+            getLogger().info("Robot ready to move: " + robot.isReadyToMove());
+            getLogger().info("Robot has active motion command: " + robot.hasActiveMotionCommand());
+            getLogger().info("Current joint position: " + robot.getCurrentJointPosition());
+            getLogger().info("Current cartesian position: " + robot.getCurrentCartesianPosition(robot.getFlange()));
+            
+            // Test 2: Try a simple PTP motion
+            getLogger().info("TEST 2: Simple PTP motion test");
+            JointPosition currentPos = robot.getCurrentJointPosition();
+            getLogger().info("Current position: " + currentPos);
+            
+            // Move slightly from current position
+            JointPosition testPos = new JointPosition(
+                currentPos.get(0) + 0.1,
+                currentPos.get(1),
+                currentPos.get(2),
+                currentPos.get(3),
+                currentPos.get(4),
+                currentPos.get(5),
+                currentPos.get(6)
+            );
+            
+            getLogger().info("Test position: " + testPos);
+            robot.move(ptp(testPos).setJointVelocityRel(0.1));
+            getLogger().info("TEST 2: PTP motion completed successfully");
+            
+            // Test 3: Check if robot can be moved manually
+            getLogger().info("TEST 3: Manual movement capability");
+            getLogger().info("Robot should now be in a state where manual movement is possible");
+            
+        } catch (Exception e) {
+            getLogger().error("ROBOT FUNCTIONALITY TEST FAILED: " + e.getMessage());
+            e.printStackTrace();
+        }
+        
+        getLogger().info("=== ROBOT FUNCTIONALITY TEST COMPLETE ===");
+    }
+    
     private void loadConfigurationFromDataXML() {
         try {
             // Load ROS2 communication settings
@@ -191,32 +321,65 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
     }
     
     private void executeTrajectoryPoints(List<Frame> trajectoryFrames) {
+        getLogger().info("=== TRAJECTORY EXECUTION START ===");
         isExecutingTrajectory.set(true);
         
         try {
+            // DIAGNOSTIC CHECK 12: Robot status before trajectory execution
+            getLogger().info("DIAGNOSTIC CHECK 12: Robot status before trajectory execution");
+            getLogger().info("Robot ready to move: " + robot.isReadyToMove());
+            getLogger().info("Robot has active motion command: " + robot.hasActiveMotionCommand());
+            getLogger().info("Current motion container: " + (currentMotionContainer != null ? "Exists" : "NULL"));
+            
+            // Cancel PositionHold before starting trajectory
+            if (currentMotionContainer != null && !currentMotionContainer.isFinished()) {
+                getLogger().info("DIAGNOSTIC CHECK 13: Cancelling PositionHold for trajectory execution");
+                currentMotionContainer.cancel();
+                getLogger().info("DIAGNOSTIC CHECK 13: PositionHold cancelled successfully");
+            } else {
+                getLogger().info("DIAGNOSTIC CHECK 13: No active PositionHold to cancel");
+            }
+            
             // Setup Position Control Mode with compliance monitoring
+            getLogger().info("DIAGNOSTIC CHECK 14: Setting up Position Control Mode");
             PositionControlMode positionMode = new PositionControlMode();
+            getLogger().info("DIAGNOSTIC CHECK 14: Position Control Mode created successfully");
             
             // Configure position control parameters for more compliant behavior
             // Note: In standard KUKA Sunrise Workbench, we use position control
             // but monitor external forces to simulate impedance-like behavior
             
-            getLogger().info("Position Control Mode configured with force monitoring");
+            getLogger().info("DIAGNOSTIC CHECK 14: Position Control Mode configured with force monitoring");
             getLogger().info("Stiffness parameters (for reference): X=" + stiffnessX + ", Y=" + stiffnessY + ", Z=" + stiffnessZ + ", Rot=" + stiffnessRot);
             getLogger().info("Damping: " + damping);
             
             // Execute trajectory point by point
-            for (Frame targetFrame : trajectoryFrames) {
+            for (int i = 0; i < trajectoryFrames.size(); i++) {
+                Frame targetFrame = trajectoryFrames.get(i);
+                
                 if (!isExecutingTrajectory.get()) {
-                    getLogger().info("Trajectory execution stopped");
+                    getLogger().info("DIAGNOSTIC CHECK 15: Trajectory execution stopped by user");
                     break;
                 }
                 
-                // Move to target with position control
-                LIN motion = new LIN(targetFrame);
-                motion.setMode(positionMode);
+                getLogger().info("DIAGNOSTIC CHECK 15: Executing trajectory point " + (i+1) + "/" + trajectoryFrames.size());
+                getLogger().info("Target frame: " + targetFrame);
+                getLogger().info("Robot ready to move: " + robot.isReadyToMove());
                 
-                currentMotionContainer = robot.moveAsync(motion);
+                // Move to target with position control
+                try {
+                    LIN motion = new LIN(targetFrame);
+                    motion.setMode(positionMode);
+                    getLogger().info("DIAGNOSTIC CHECK 15: LIN motion created successfully");
+                    
+                    currentMotionContainer = robot.moveAsync(motion);
+                    getLogger().info("DIAGNOSTIC CHECK 15: Motion started successfully");
+                    
+                } catch (Exception e) {
+                    getLogger().error("DIAGNOSTIC ERROR: Failed to execute motion: " + e.getMessage());
+                    e.printStackTrace();
+                    break;
+                }
                 
                 // Monitor execution and external forces
                 while (!currentMotionContainer.isFinished() && isExecutingTrajectory.get()) {
@@ -249,9 +412,17 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
             trajectoryOut.println("TRAJECTORY_COMPLETE");
             getLogger().info("Trajectory execution completed");
             
+            // Restart PositionHold after trajectory completion
+            getLogger().info("Restarting PositionHold for compliant waiting");
+            currentMotionContainer = robot.moveAsync(positionHold);
+            
         } catch (Exception e) {
             getLogger().error("Error during trajectory execution: " + e.getMessage());
             trajectoryOut.println("ERROR:" + e.getMessage());
+            
+            // Restart PositionHold even if trajectory failed
+            getLogger().info("Restarting PositionHold after trajectory error");
+            currentMotionContainer = robot.moveAsync(positionHold);
         } finally {
             isExecutingTrajectory.set(false);
         }
