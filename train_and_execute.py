@@ -59,19 +59,31 @@ class TrainAndExecute(Node):
             self.kuka_socket = None
     
     def load_demos(self):
-        """Load demonstrations from file"""
+        """Load demonstrations from file and flatten any 3D arrays into a list of 2D arrays."""
         try:
             self.demos = np.load(self.demo_file, allow_pickle=True)
+            demos_list = []
             if isinstance(self.demos, np.ndarray) and self.demos.dtype == object:
-                self.demos = list(self.demos)
+                for demo in self.demos:
+                    arr = np.array(demo)
+                    if arr.ndim == 3:
+                        # Flatten 3D array into list of 2D arrays
+                        for i in range(arr.shape[0]):
+                            demos_list.append(arr[i])
+                    else:
+                        demos_list.append(arr)
+                self.demos = demos_list
             elif isinstance(self.demos, np.ndarray):
-                # If it's a 3D array, convert to list of 2D arrays
                 if self.demos.ndim == 3:
-                    self.demos = [self.demos[i] for i in range(self.demos.shape[0])]
+                    for i in range(self.demos.shape[0]):
+                        demos_list.append(self.demos[i])
+                    self.demos = demos_list
+                else:
+                    self.demos = [self.demos]
             self.get_logger().info(f'Loaded {len(self.demos)} demonstrations from {self.demo_file}')
             # Debug: print shape of each demo
             for i, demo in enumerate(self.demos):
-                print(f"Demo {i} shape: {np.array(demo).shape}")
+                print(f"Demo {i} type: {type(demo)}, shape: {np.array(demo).shape}")
         except FileNotFoundError:
             self.get_logger().error(f'Demo file not found: {self.demo_file}')
             self.demos = []
@@ -100,6 +112,9 @@ class TrainAndExecute(Node):
             
             normalized.append(np.column_stack(normalized_demo))
         
+        # Debug: print shape of each normalized demo
+        for i, demo in enumerate(normalized):
+            print(f"Normalized demo {i} shape: {demo.shape}")
         return normalized
     
     def train_promp(self):
