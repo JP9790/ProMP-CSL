@@ -248,25 +248,24 @@ class InteractiveDemoRecorder(Node):
             self.get_logger().error(f'Error receiving torque data: {e}')
     
     def save_individual_demo(self, demo_data, demo_number):
-        """Save individual demonstration to file"""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(self.save_directory, f'demo_{demo_number:03d}_{timestamp}.npy')
-        
+        """Save individual demonstration to .npy and .csv files (overwrite if exists)"""
+        npy_filename = os.path.join(self.save_directory, f'demo_{demo_number:03d}.npy')
+        csv_filename = os.path.join(self.save_directory, f'demo_{demo_number:03d}.csv')
         try:
-            np.save(filename, np.array(demo_data))
-            self.get_logger().info(f'Individual demo saved to: {filename}')
-            return filename
+            np.save(npy_filename, np.array(demo_data))
+            np.savetxt(csv_filename, np.array(demo_data), delimiter=',')
+            self.get_logger().info(f'Individual demo saved to: {npy_filename} and {csv_filename}')
+            return npy_filename, csv_filename
         except Exception as e:
             self.get_logger().error(f'Error saving individual demo: {e}')
-            return None
-    
+            return None, None
+
     def save_all_demos(self, filename=None):
-        """Save all demonstrations to file"""
+        """Save all demonstrations to all_demos.npy (overwrite)"""
         if len(self.demos) == 0:
             return
         if filename is None:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = os.path.join(self.save_directory, f'all_demos_{timestamp}.npy')
+            filename = os.path.join(self.save_directory, 'all_demos.npy')
         try:
             np.save(filename, np.array(self.demos, dtype=object))
             self.get_logger().info(f'All demos saved to: {filename}')
