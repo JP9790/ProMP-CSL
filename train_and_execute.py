@@ -64,7 +64,14 @@ class TrainAndExecute(Node):
             self.demos = np.load(self.demo_file, allow_pickle=True)
             if isinstance(self.demos, np.ndarray) and self.demos.dtype == object:
                 self.demos = list(self.demos)
+            elif isinstance(self.demos, np.ndarray):
+                # If it's a 3D array, convert to list of 2D arrays
+                if self.demos.ndim == 3:
+                    self.demos = [self.demos[i] for i in range(self.demos.shape[0])]
             self.get_logger().info(f'Loaded {len(self.demos)} demonstrations from {self.demo_file}')
+            # Debug: print shape of each demo
+            for i, demo in enumerate(self.demos):
+                print(f"Demo {i} shape: {np.array(demo).shape}")
         except FileNotFoundError:
             self.get_logger().error(f'Demo file not found: {self.demo_file}')
             self.demos = []
