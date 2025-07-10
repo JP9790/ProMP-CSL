@@ -176,6 +176,27 @@ Balancing short&amp; long term adaptation in ProMPs
     - Built-in ProMP training
     - Demo visualization
 
+# 7.2. Train ProMP Only (with Visualization)
+    ```
+    # Train ProMP and visualize results (no execution)
+    ros2 run kuka_promp_control train_promp_only_node --ros-args \
+      -p demo_file:=all_demos.npy \
+      -p trajectory_file:=learned_trajectory.npy \
+      -p promp_file:=promp_model.npy
+    ```
+    - This will show a plot of all demos, the learned trajectory, and the ProMP distribution.
+    - The files `learned_trajectory.npy` and `promp_model.npy` will be saved for use in the deformation controller.
+
+# 7.3. Deformation Controller (Real-Time Adaptive Execution)
+    ```
+    # Launch the deformation controller to execute and adapt the trajectory in real time
+    ros2 launch kuka_promp_control deformation_controller.launch.py kuka_ip:=172.31.1.147 \
+      trajectory_file:=learned_trajectory.npy \
+      promp_file:=promp_model.npy
+    ```
+    - This will execute the learned trajectory and adapt it in real time if the user applies external force/torque.
+    - Only the deformation controller should be running during execution for real-time adaptation.
+
 # 8. Initial Record 
     ```
     # In another terminal, run the control script

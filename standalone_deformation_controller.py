@@ -210,32 +210,52 @@ class StandaloneDeformationController(Node):
         return None
     
     def start_execution(self):
-        """Start trajectory execution with deformation monitoring"""
-        if self.current_trajectory is None:
-            self.get_logger().error('No trajectory loaded for execution')
-            return False
-        
+        """Start execution of the trajectory with real-time deformation"""
         if self.is_executing:
             self.get_logger().warn('Execution already in progress')
-            return False
-        
+            return
+        if self.current_trajectory is None:
+            self.get_logger().error('No trajectory loaded for execution')
+            return
         self.is_executing = True
-        self.is_monitoring = True
-        
-        # Start execution thread
         self.execution_thread = threading.Thread(target=self.execution_loop)
         self.execution_thread.daemon = True
         self.execution_thread.start()
-        
-        # Start monitoring thread
-        self.monitoring_thread = threading.Thread(target=self.monitoring_loop)
-        self.monitoring_thread.daemon = True
-        self.monitoring_thread.start()
-        
         self.get_logger().info('Started trajectory execution with deformation monitoring')
-        self.execution_status_pub.publish(String(data='EXECUTION_STARTED'))
-        
-        return True
+
+    def execution_loop(self):
+        """Main execution loop: send trajectory to KUKA, monitor torque, and deform in real time"""
+        trajectory = np.copy(self.current_trajectory)
+        num_points = trajectory.shape[0]
+        dt = 0.01  # 100 Hz
+        for i in range(num_points):
+            if not self.is_executing:
+                break
+            # Check for external torque/force
+            if len(self.torque_data) > 0:
+                latest = self.torque_data[-1]
+                max_force = max(abs(f) for f in latest['force'])
+                max_torque = max(abs(t) for t in latest['torque'])
+                if max_force > self.force_threshold or max_torque > self.torque_threshold:
+                    # Deform trajectory at this point
+                    if self.promp is not None:
+                        t_condition = i / num_points
+                        y_condition = trajectory[i]
+                        self.promp.condition_on_waypoint(t_condition, y_condition)
+                        # Regenerate trajectory from this point
+                        trajectory[i:] = self.promp.generate_trajectory(num_points=num_points - i)
+                        self.get_logger().info(f'Deformed trajectory at point {i} due to external interaction')
+            # Send current point to KUKA
+            point_str = ','.join(map(str, trajectory[i]))
+            command = f"TRAJECTORY_POINT:{point_str}"
+            try:
+                self.kuka_socket.sendall((command + "\n").encode('utf-8'))
+            except Exception as e:
+                self.get_logger().error(f'Error sending trajectory point: {e}')
+                break
+            time.sleep(dt)
+        self.is_executing = False
+        self.get_logger().info('Trajectory execution finished')
     
     def stop_execution(self):
         """Stop trajectory execution"""
@@ -253,21 +273,6 @@ class StandaloneDeformationController(Node):
         
         # Publish final statistics
         self.publish_statistics()
-    
-    def execution_loop(self):
-        """Main execution loop"""
-        try:
-            # Send initial trajectory to KUKA
-            self.send_trajectory_to_kuka(self.current_trajectory)
-            
-            # Monitor execution progress
-            while self.is_executing:
-                time.sleep(0.1)  # 10 Hz monitoring
-                
-        except Exception as e:
-            self.get_logger().error(f'Error in execution loop: {e}')
-        finally:
-            self.is_executing = False
     
     def monitoring_loop(self):
         """Deformation monitoring loop"""
