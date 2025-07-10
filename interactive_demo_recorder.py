@@ -93,8 +93,10 @@ class InteractiveDemoRecorder(Node):
     def setup_communication(self):
         """Setup TCP communication with KUKA robot"""
         try:
+            self.get_logger().info(f"Connecting to KUKA at {self.kuka_ip}:{self.kuka_port} ...")
             # Connect to KUKA for sending trajectories
             self.kuka_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.kuka_socket.settimeout(5)  # 5 second timeout
             self.kuka_socket.connect((self.kuka_ip, self.kuka_port))
             
             # Wait for READY signal from Java application
@@ -118,6 +120,7 @@ class InteractiveDemoRecorder(Node):
             
         except Exception as e:
             self.get_logger().error(f'Failed to setup communication: {e}')
+            # Do not return here; allow the rest of the node to run
     
     def setup_services(self):
         """Setup ROS2 services for control"""
