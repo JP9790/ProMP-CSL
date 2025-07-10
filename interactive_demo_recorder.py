@@ -264,13 +264,11 @@ class InteractiveDemoRecorder(Node):
         """Save all demonstrations to file"""
         if len(self.demos) == 0:
             return
-            
         if filename is None:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = os.path.join(self.save_directory, f'all_demos_{timestamp}.npy')
-        
         try:
-            np.save(filename, self.demos)
+            np.save(filename, np.array(self.demos, dtype=object))
             self.get_logger().info(f'All demos saved to: {filename}')
             return filename
         except Exception as e:
@@ -318,49 +316,11 @@ class InteractiveDemoRecorder(Node):
             self.get_logger().error(f'Error listing demo files: {e}')
             return []
     
-    def train_promp(self):
-        """Train ProMP on recorded demonstrations"""
-        if len(self.demos) < 1:
-            self.get_logger().warn('No demonstrations available for training')
-            return False
-        
-        try:
-            # Normalize demonstrations to same length
-            normalized_demos = self.normalize_demos()
-            
-            # Train ProMP
-            self.promp = ProMP(num_basis=self.num_basis, sigma_noise=self.sigma_noise)
-            self.promp.train(normalized_demos)
-            
-            # Generate learned trajectory
-            self.learned_trajectory = self.promp.generate_trajectory()
-            
-            self.get_logger().info('ProMP training completed')
-            return True
-            
-        except Exception as e:
-            self.get_logger().error(f'Error training ProMP: {e}')
-            return False
-    
-    def normalize_demos(self):
-        """Normalize demonstrations to same length using interpolation"""
-        target_length = 100  # Normalize to 100 points
-        normalized = []
-        
-        for demo in self.demos:
-            demo_array = np.array(demo)
-            t_old = np.linspace(0, 1, len(demo))
-            t_new = np.linspace(0, 1, target_length)
-            
-            normalized_demo = []
-            for i in range(demo_array.shape[1]):  # For each dimension
-                interp_func = interp1d(t_old, demo_array[:, i], kind='cubic')
-                normalized_demo.append(interp_func(t_new))
-            
-            normalized.append(np.column_stack(normalized_demo))
-        
-        return normalized
-    
+    # Remove or comment out ProMP training and execution methods
+    # def train_promp(self): ...
+    # def normalize_demos(self): ...
+    # etc.
+
     def timer_callback(self):
         """Periodic timer callback"""
         # Publish status
@@ -406,7 +366,6 @@ def main(args=None):
     print("  'stop' - Stop current recording")
     print("  'info' - Show demo information")
     print("  'list' - List saved demo files")
-    print("  'train' - Train ProMP on recorded demos")
     print("  'plot' - Plot recorded demos")
     print("  'clear' - Clear all demos")
     print("  'quit' - Exit the program")
@@ -439,13 +398,6 @@ def main(args=None):
                 for file in demo_files:
                     print(f"  {file}")
                 
-            elif command == 'train':
-                print("Training ProMP on recorded demos...")
-                if node.train_promp():
-                    print("ProMP training completed successfully!")
-                else:
-                    print("ProMP training failed!")
-                    
             elif command == 'plot':
                 print("Plotting recorded demos...")
                 node.plot_demos()
@@ -461,7 +413,7 @@ def main(args=None):
                 break
                 
             else:
-                print("Unknown command. Available commands: start, stop, info, list, train, plot, clear, quit")
+                print("Unknown command. Available commands: start, stop, info, list, plot, clear, quit")
                 
     except KeyboardInterrupt:
         print("\nInterrupted by user")

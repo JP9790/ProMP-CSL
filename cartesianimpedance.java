@@ -53,7 +53,7 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
     private double torqueThreshold = 2.0; // Nm
     
     // ROS2 PC IP address - Same network as KUKA
-    private String ros2PCIP = "192.170.10.1"; // ROS2 PC IP (same network)
+    private String ros2PCIP = "172.31.1.100"; // ROS2 PC IP (same network)
     
     // Initial position for the robot
     private static final JointPosition INITIAL_POSITION = new JointPosition(0.0, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0);
@@ -100,6 +100,11 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
         } catch (IOException e) {
             getLogger().error("DIAGNOSTIC ERROR: Could not connect to ROS2 PC for torque data: " + e.getMessage());
         }
+        
+        // Print out the controller and ROS2 PC IPs for diagnostics
+        String controllerIP = getApplicationData().getProcessData("controller_ip").getValue().toString();
+        getLogger().info("Controller IP: " + controllerIP);
+        getLogger().info("ROS2 PC IP: " + ros2PCIP);
         
         getLogger().info("=== INITIALIZATION COMPLETE ===");
     }

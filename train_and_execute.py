@@ -61,7 +61,9 @@ class TrainAndExecute(Node):
     def load_demos(self):
         """Load demonstrations from file"""
         try:
-            self.demos = np.load(self.demo_file, allow_pickle=True).tolist()
+            self.demos = np.load(self.demo_file, allow_pickle=True)
+            if isinstance(self.demos, np.ndarray) and self.demos.dtype == object:
+                self.demos = list(self.demos)
             self.get_logger().info(f'Loaded {len(self.demos)} demonstrations from {self.demo_file}')
         except FileNotFoundError:
             self.get_logger().error(f'Demo file not found: {self.demo_file}')
