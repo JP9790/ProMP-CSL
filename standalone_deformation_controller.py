@@ -12,6 +12,7 @@ import json
 import argparse
 from .trajectory_deformer import TrajectoryDeformer
 from .promp import ProMP
+from .stepwise_em_learner import StepwiseEMLearner
 
 class StandaloneDeformationController(Node):
     def __init__(self):
@@ -229,25 +230,42 @@ class StandaloneDeformationController(Node):
         num_points = trajectory.shape[0]
         dt = 0.01  # 100 Hz
         # Send the full trajectory at the start
-        trajectory_str = ";".join([",".join(map(str, point)) for point in trajectory])
-        command = f"TRAJECTORY:{trajectory_str}"
-        try:
-            self.kuka_socket.sendall((command + "\n").encode('utf-8'))
-            self.get_logger().info('Sent full trajectory to KUKA')
-            # Wait for completion
-            while True:
-                response = self.kuka_socket.recv(1024).decode('utf-8')
-                self.get_logger().info(f'KUKA response: {response}')
-                if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info('Trajectory executed successfully on KUKA')
-                    break
-                elif "ERROR" in response:
-                    self.get_logger().error(f'KUKA execution error: {response}')
-                    break
-                elif "POINT_COMPLETE" in response:
-                    continue
-        except Exception as e:
-            self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
+        self.send_trajectory_to_kuka(trajectory)
+        self.get_logger().info('Started monitoring for deformation during execution')
+        while self.is_executing:
+            # Check for external torque/force
+            if len(self.torque_data) > 0:
+                latest = self.torque_data[-1]
+                max_force = max(abs(f) for f in latest['force'])
+                max_torque = max(abs(t) for t in latest['torque'])
+                if max_force > self.force_threshold or max_torque > self.torque_threshold:
+                    # Compute deformation energy (example: norm of force+torque)
+                    energy = np.linalg.norm(latest['force']) + np.linalg.norm(latest['torque'])
+                    self.get_logger().info(f'Deformation detected! Energy: {energy:.4f}')
+                    # Send STOP to robot
+                    self.kuka_socket.sendall(b"STOP\n")
+                    self.get_logger().info('Sent STOP to robot, waiting for STOPPED...')
+                    while True:
+                        response = self.kuka_socket.recv(1024).decode('utf-8')
+                        self.get_logger().info(f'KUKA response: {response}')
+                        if "STOPPED" in response:
+                            break
+                    # Generate new trajectory
+                    if energy < self.energy_threshold:
+                        self.get_logger().info('Triggering ProMP conditioning (low energy)')
+                        t_condition = 0.5  # Example: mid-trajectory, or use actual index
+                        y_condition = trajectory[int(num_points * t_condition)]
+                        self.promp.condition_on_waypoint(t_condition, y_condition)
+                        new_traj = self.promp.generate_trajectory(num_points=num_points)
+                    else:
+                        self.get_logger().info('Triggering stepwise EM update (high energy)')
+                        em_learner = StepwiseEMLearner(self.promp)
+                        new_traj = em_learner.update_and_generate(trajectory, latest)
+                    # Send new trajectory
+                    self.send_trajectory_to_kuka(new_traj)
+                    self.get_logger().info('Sent new trajectory to robot after deformation')
+                    trajectory = new_traj
+            time.sleep(dt)
         self.is_executing = False
         self.get_logger().info('Trajectory execution finished')
     
@@ -357,31 +375,25 @@ class StandaloneDeformationController(Node):
         self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
     
     def send_trajectory_to_kuka(self, trajectory):
-        """Send trajectory to KUKA robot"""
-        if self.kuka_socket is None:
-            self.get_logger().error('No connection to KUKA robot')
-            return False
-        
+        """Send full trajectory to KUKA robot and wait for completion"""
+        trajectory_str = ";".join([",".join(map(str, point)) for point in trajectory])
+        command = f"TRAJECTORY:{trajectory_str}"
         try:
-            # Format trajectory for KUKA
-            trajectory_str = ";".join([
-                ",".join(map(str, point)) for point in trajectory
-            ])
-            
-            command = f"TRAJECTORY:{trajectory_str}"
             self.kuka_socket.sendall((command + "\n").encode('utf-8'))
-            
-            # Wait for acknowledgment
-            response = self.kuka_socket.recv(1024).decode('utf-8')
-            if "TRAJECTORY_COMPLETE" in response or "POINT_COMPLETE" in response:
-                return True
-            else:
-                self.get_logger().warn(f'Unexpected KUKA response: {response}')
-                return False
-                
+            self.get_logger().info('Sent full trajectory to KUKA')
+            while True:
+                response = self.kuka_socket.recv(1024).decode('utf-8')
+                self.get_logger().info(f'KUKA response: {response}')
+                if "TRAJECTORY_COMPLETE" in response:
+                    self.get_logger().info('Trajectory executed successfully on KUKA')
+                    break
+                elif "ERROR" in response:
+                    self.get_logger().error(f'KUKA execution error: {response}')
+                    break
+                elif "POINT_COMPLETE" in response:
+                    continue
         except Exception as e:
             self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
-            return False
     
     def publish_statistics(self):
         """Publish execution statistics"""
