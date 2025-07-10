@@ -83,9 +83,12 @@ Balancing short&amp; long term adaptation in ProMPs
         entry_points={
             'console_scripts': [
                 'demo_recorder = kuka_promp_control.demo_recorder:main',
+                'interactive_demo_recorder = kuka_promp_control.interactive_demo_recorder:main',
                 'control_script = kuka_promp_control.control_script:main',
                 'train_and_execute = kuka_promp_control.train_and_execute:main',
                 'standalone_deformation_controller = kuka_promp_control.standalone_deformation_controller:main',
+                'trajectory_deformer = kuka_promp_control.trajectory_deformer:main',
+                'stepwise_em_learner = kuka_promp_control.stepwise_em_learner:main',
             ],
         },
     )
@@ -140,6 +143,38 @@ Balancing short&amp; long term adaptation in ProMPs
     # Launch the demo recorder
     ros2 launch kuka_promp_control demo_recorder.launch.py kuka_ip:=192.170.10.25
     ```
+
+# 7.1. Interactive Demo Recording (NEW!)
+    ```
+    # Launch interactive demo recorder
+    ros2 launch kuka_promp_control interactive_demo_recorder.launch.py
+    
+    # Or with custom parameters
+    ros2 launch kuka_promp_control interactive_demo_recorder.launch.py \
+        kuka_ip:=192.170.10.25 \
+        save_directory:=~/my_robot_demos \
+        demo_duration:=15.0 \
+        record_frequency:=50.0
+    ```
+    
+    **Interactive Commands:**
+    - `start` - Start recording a new demo
+    - `stop` - Stop current recording  
+    - `info` - Show demo information
+    - `list` - List saved demo files
+    - `train` - Train ProMP on recorded demos
+    - `plot` - Plot recorded demos
+    - `clear` - Clear all demos
+    - `quit` - Exit the program
+    
+    **Features:**
+    - Records multiple demos interactively
+    - Saves individual demos with timestamps
+    - Auto-saves after each recording
+    - Customizable save directory
+    - Real-time demo information
+    - Built-in ProMP training
+    - Demo visualization
 
 # 8. Initial Record 
     ```
