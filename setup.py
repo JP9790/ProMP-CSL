@@ -26,9 +26,11 @@ setup(
             'demo_recorder = kuka_promp_control.demo_recorder:main',
             'interactive_demo_recorder = kuka_promp_control.interactive_demo_recorder:main',
             'train_and_execute = kuka_promp_control.train_and_execute:main',
+            'train_promp_only_node = kuka_promp_control.train_promp_only_node:main',
             'standalone_deformation_controller = kuka_promp_control.standalone_deformation_controller:main',
             'trajectory_deformer = kuka_promp_control.trajectory_deformer:main',
             'stepwise_em_learner = kuka_promp_control.stepwise_em_learner:main',
+            'control_script = kuka_promp_control.control_script:main',
         ],
     },
 ) 

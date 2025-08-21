@@ -8,7 +8,7 @@ def generate_launch_description():
         # KUKA Communication Parameters
         DeclareLaunchArgument(
             'kuka_ip',
-            default_value='192.170.10.25',
+            default_value='172.31.1.147',
             description='IP address of KUKA robot'
         ),
         
@@ -16,6 +16,12 @@ def generate_launch_description():
             'kuka_port',
             default_value='30002',
             description='Port for KUKA communication'
+        ),
+        
+        DeclareLaunchArgument(
+            'torque_port',
+            default_value='30003',
+            description='Port for receiving torque data from KUKA'
         ),
         
         # File Paths
@@ -106,9 +112,10 @@ def generate_launch_description():
             executable='standalone_deformation_controller',
             name='deformation_controller',
             parameters=[{
-                # KUKA Communication
+                # KUKA Communication (using the new all-in-one Java app)
                 'kuka_ip': LaunchConfiguration('kuka_ip'),
                 'kuka_port': LaunchConfiguration('kuka_port'),
+                'torque_port': LaunchConfiguration('torque_port'),
                 
                 # File Paths
                 'trajectory_file': LaunchConfiguration('trajectory_file'),

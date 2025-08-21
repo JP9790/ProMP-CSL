@@ -185,40 +185,88 @@ class InteractiveDemoRecorder(Node):
         self.status_pub.publish(String(data=f'DEMO_{self.demo_counter}_COMPLETED'))
     
     def record_demo_thread(self):
-        """Thread for recording demonstration data"""
+        """Thread for recording demonstration data using the new Java app commands"""
         start_time = time.time()
         dt = 1.0 / self.record_freq
         
+        # Start demo recording on the Java app
+        if self.kuka_connected:
+            try:
+                self.kuka_socket.sendall(b'START_DEMO_RECORDING\n')
+                response = self.kuka_socket.recv(1024).decode('utf-8').strip()
+                if response == "DEMO_RECORDING_STARTED":
+                    self.get_logger().info("Demo recording started on Java app")
+                else:
+                    self.get_logger().error(f"Failed to start demo recording: {response}")
+                    return
+            except Exception as e:
+                self.get_logger().error(f"Error starting demo recording: {e}')
+                return
+        
         while self.is_recording and (time.time() - start_time) < self.demo_duration:
             try:
-                # Get current pose from robot's current position
-                if self.kuka_connected:
-                    self.kuka_socket.sendall(b'GET_POSE\n')
-                    response = self.kuka_socket.recv(1024).decode('utf-8').strip()
-                    
-                    if response.startswith('POSE:'):
-                        pose_data = response[5:].strip().split(',')
-                        if len(pose_data) >= 6:
-                            pose = [float(x) for x in pose_data[:6]]  # x, y, z, alpha, beta, gamma
-                            self.current_demo.append(pose)
-                    elif response == "ERROR:GET_POSE_NOT_IMPLEMENTED":
-                        # Fallback: use simulated pose data for testing
-                        simulated_pose = [
-                            np.sin(time.time() * 0.5) * 0.1,  # x
-                            np.cos(time.time() * 0.3) * 0.1,  # y
-                            0.5 + np.sin(time.time() * 0.2) * 0.05,  # z
-                            0.0,  # alpha
-                            0.0,  # beta
-                            np.sin(time.time() * 0.1) * 0.1   # gamma
-                        ]
-                        self.current_demo.append(simulated_pose)
-                        self.get_logger().debug('Using simulated pose data (GET_POSE not implemented in Java)')
-                
+                # The Java app is now recording the demo data internally
+                # We just need to wait and monitor the recording
                 time.sleep(dt)
                 
             except Exception as e:
-                self.get_logger().error(f'Error recording demo: {e}')
+                self.get_logger().error(f'Error during demo recording: {e}')
                 break
+        
+        # Stop demo recording on the Java app
+        if self.kuka_connected:
+            try:
+                self.kuka_socket.sendall(b'STOP_DEMO_RECORDING\n')
+                response = self.kuka_socket.recv(1024).decode('utf-8').strip()
+                if response == "DEMO_RECORDING_STOPPED":
+                    self.get_logger().info("Demo recording stopped on Java app")
+                else:
+                    self.get_logger().error(f"Failed to stop demo recording: {response}")
+            except Exception as e:
+                self.get_logger().error(f"Error stopping demo recording: {e}")
+    
+    def retrieve_demos_from_java(self):
+        """Retrieve all recorded demos from the Java app"""
+        if not self.kuka_connected:
+            self.get_logger().error("Not connected to Java app")
+            return False
+        
+        try:
+            # Request all demos from Java app
+            self.kuka_socket.sendall(b'GET_DEMOS\n')
+            response = self.kuka_socket.recv(8192).decode('utf-8').strip()  # Larger buffer for demos
+            
+            if response.startswith('DEMOS:'):
+                # Parse the demos from Java app
+                demos_data = response[6:]  # Remove 'DEMOS:' prefix
+                demo_sections = demos_data.split('|')
+                
+                self.demos.clear()  # Clear existing demos
+                
+                for section in demo_sections:
+                    if section.strip() and section.startswith('DEMO_'):
+                        # Parse individual demo
+                        demo_lines = section.split(';')
+                        demo_data = []
+                        
+                        for line in demo_lines:
+                            if line.strip() and ',' in line:
+                                pose_values = [float(x) for x in line.split(',')]
+                                if len(pose_values) >= 6:
+                                    demo_data.append(pose_values[:6])  # x, y, z, alpha, beta, gamma
+                        
+                        if demo_data:
+                            self.demos.append(demo_data)
+                
+                self.get_logger().info(f"Retrieved {len(self.demos)} demos from Java app")
+                return True
+            else:
+                self.get_logger().error(f"Failed to retrieve demos: {response}")
+                return False
+                
+        except Exception as e:
+            self.get_logger().error(f"Error retrieving demos from Java app: {e}")
+            return False
     
     def receive_torque_data(self):
         """Receive torque data from KUKA robot"""
@@ -262,8 +310,16 @@ class InteractiveDemoRecorder(Node):
 
     def save_all_demos(self, filename=None):
         """Save all demonstrations to all_demos.npy (overwrite)"""
+        # First retrieve demos from Java app
+        if self.kuka_connected:
+            if not self.retrieve_demos_from_java():
+                self.get_logger().error("Failed to retrieve demos from Java app")
+                return None
+        
         if len(self.demos) == 0:
-            return
+            self.get_logger().warn("No demos to save")
+            return None
+            
         if filename is None:
             filename = os.path.join(self.save_directory, 'all_demos.npy')
         try:

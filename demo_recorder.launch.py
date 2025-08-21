@@ -7,13 +7,13 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'kuka_ip',
-            default_value='192.170.10.25',  # KUKA robot IP (same network as PC)
+            default_value='172.31.1.147',  # KUKA robot IP (same network as PC)
             description='IP address of KUKA robot'
         ),
         
         DeclareLaunchArgument(
             'ros2_pc_ip',
-            default_value='192.170.10.1',  # ROS2 PC IP (what KUKA connects to)
+            default_value='172.31.1.100',  # ROS2 PC IP (what KUKA connects to)
             description='IP address of ROS2 PC (what KUKA connects to)'
         ),
         
