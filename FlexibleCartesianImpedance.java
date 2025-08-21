@@ -290,7 +290,12 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         out.println("DEMO_RECORDING_STARTED");
         
         // Start recording thread
-        new Thread(() -> recordDemoData()).start();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                recordDemoData();
+            }
+        }).start();
     }
     
     private void stopDemoRecording() {
