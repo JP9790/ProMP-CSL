@@ -35,10 +35,10 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
     private PrintWriter torqueDataOut;
     
     // Control parameters
-    private double stiffnessX = 50.0; // N/m
-    private double stiffnessY = 50.0;
-    private double stiffnessZ = 50.0;
-    private double stiffnessRot = 20.0; // Nm/rad
+    private double stiffnessX = 250.0; // N/m
+    private double stiffnessY = 250.0;
+    private double stiffnessZ = 250.0;
+    private double stiffnessRot = 50.0; // Nm/rad
     private double damping = 0.7; // Damping ratio
     
     // Control flags
@@ -566,4 +566,5 @@ public class Cartesianimpedance extends RoboticsAPIApplication {
         cleanup();
         super.dispose();
     }
+
 }
