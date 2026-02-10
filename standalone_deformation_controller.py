@@ -32,6 +32,7 @@ class StandaloneDeformationController(Node):
         default_trajectory = os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy')
         self.declare_parameter('trajectory_file', default_trajectory)
         self.declare_parameter('promp_file', 'promp_model.npy')
+        self.declare_parameter('auto_start', True)  # Auto-start execution on initialization
         
         # Get parameters
         self.kuka_ip = self.get_parameter('kuka_ip').value
@@ -44,6 +45,7 @@ class StandaloneDeformationController(Node):
         self.promp_conditioning_sigma = self.get_parameter('promp_conditioning_sigma').value
         self.trajectory_file = self.get_parameter('trajectory_file').value
         self.promp_file = self.get_parameter('promp_file').value
+        self.auto_start = self.get_parameter('auto_start').value
         
         # Components
         self.deformer = TrajectoryDeformer(
@@ -79,6 +81,12 @@ class StandaloneDeformationController(Node):
         
         # Load trajectory and ProMP
         self.load_trajectory_and_promp()
+        
+        # Auto-start execution if enabled and trajectory is loaded
+        if self.auto_start and self.current_trajectory is not None:
+            self.get_logger().info('Auto-start enabled: Starting trajectory execution...')
+            # Give a small delay to ensure everything is initialized
+            threading.Timer(1.0, self.start_execution).start()
         
         self.get_logger().info('Standalone Deformation Controller initialized')
         
@@ -443,22 +451,56 @@ class StandaloneDeformationController(Node):
         self.get_logger().info('Started trajectory execution with deformation monitoring')
 
     def execution_loop(self):
-        """Main execution loop: send trajectory to KUKA, monitor torque, and deform in real time"""
+        """Main execution loop: execute trajectory first (like train_and_execute.py), 
+        then monitor torque during execution and trigger deformation when needed"""
         trajectory = np.copy(self.current_trajectory)
         num_points = trajectory.shape[0]
-        dt = 0.01  # 100 Hz
+        dt = 0.01  # 100 Hz monitoring rate
         
-        # Send the full trajectory at the start (non-blocking)
-        self.send_trajectory_to_kuka_async(trajectory)
-        self.get_logger().info('Started monitoring for deformation during execution')
+        # Step 1: Execute the initial trajectory first (like train_and_execute.py)
+        # This ensures the robot actually starts moving
+        self.get_logger().info('Starting trajectory execution...')
+        self.execution_status_pub.publish(String(data='EXECUTION_STARTED'))
         
-        # Track current execution state
-        trajectory_executing = True
+        # Send trajectory and start execution in a separate thread that monitors progress
+        # but allows interruption for deformation
+        trajectory_executing = threading.Event()
+        trajectory_executing.set()  # Set to True initially
+        execution_thread = None
+        
+        def execute_trajectory_with_monitoring(traj):
+            """Execute trajectory and monitor progress, can be interrupted"""
+            try:
+                # Use the blocking method to ensure trajectory starts executing
+                # But we'll monitor in a way that allows interruption
+                success = self.send_trajectory_to_kuka_with_interrupt(traj, trajectory_executing)
+                if success:
+                    self.get_logger().info('Initial trajectory execution completed')
+                else:
+                    self.get_logger().warn('Initial trajectory execution had errors')
+            except Exception as e:
+                self.get_logger().error(f'Error in trajectory execution: {e}')
+            finally:
+                trajectory_executing.clear()  # Mark as finished
+        
+        # Start trajectory execution in background thread
+        execution_thread = threading.Thread(target=execute_trajectory_with_monitoring, args=(trajectory,))
+        execution_thread.daemon = True
+        execution_thread.start()
+        self.get_logger().info('Trajectory execution started, beginning torque monitoring...')
+        
+        # Step 2: Monitor torque during execution
         last_deformation_time = 0
         deformation_cooldown = 0.5  # Minimum time between deformations (seconds)
         
         while self.is_executing:
-            # Check for external torque/force
+            # Check if trajectory is still executing
+            if not trajectory_executing.is_set() and execution_thread is not None:
+                # Trajectory finished, wait a bit and check if we should continue
+                time.sleep(0.1)
+                continue
+            
+            # Check for external torque/force during execution
             if len(self.torque_data) > 0:
                 latest = self.torque_data[-1]
                 max_force = max(abs(f) for f in latest['force'])
@@ -472,45 +514,49 @@ class StandaloneDeformationController(Node):
                     # Compute deformation energy
                     energy = np.linalg.norm(latest['force']) + np.linalg.norm(latest['torque'])
                     self.get_logger().info(f'Deformation detected! Energy: {energy:.4f}, Force: {max_force:.2f}N, Torque: {max_torque:.2f}Nm')
+                    self.deformation_status_pub.publish(String(data='DEFORMATION_DETECTED'))
                     
-                    # Send STOP to robot (non-blocking with timeout)
+                    # Interrupt current trajectory execution
+                    trajectory_executing.clear()  # Signal to stop monitoring current trajectory
+                    
+                    # Send STOP to robot
                     try:
                         self.kuka_socket.sendall(b"STOP\n")
-                        self.get_logger().info('Sent STOP to robot')
+                        self.get_logger().info('Sent STOP to robot to interrupt current trajectory')
                         
                         # Wait for STOPPED response with timeout
-                        self.kuka_socket.settimeout(2.0)  # 2 second timeout
+                        self.kuka_socket.settimeout(2.0)
                         try:
-                            response = self.kuka_socket.recv(1024).decode('utf-8')
-                            self.get_logger().info(f'KUKA response: {response}')
-                            if "STOPPED" not in response:
+                            response = self._receive_complete_message(self.kuka_socket, timeout=2.0)
+                            if response and "STOPPED" in response:
+                                self.get_logger().info('Robot stopped successfully')
+                            else:
                                 self.get_logger().warn('Did not receive STOPPED confirmation, proceeding anyway')
                         except socket.timeout:
                             self.get_logger().warn('Timeout waiting for STOPPED, proceeding with new trajectory')
                         finally:
-                            self.kuka_socket.settimeout(None)  # Reset timeout
+                            self.kuka_socket.settimeout(None)
                     except Exception as e:
                         self.get_logger().error(f'Error sending STOP: {e}')
                     
-                    # Get current robot position for conditioning (if available)
-                    # For now, use mid-trajectory point as condition
+                    # Get current robot position for conditioning
                     try:
-                        # Try to get current pose from robot
                         self.kuka_socket.sendall(b"GET_POSE\n")
                         self.kuka_socket.settimeout(1.0)
-                        pose_response = self.kuka_socket.recv(1024).decode('utf-8')
+                        pose_response = self._receive_complete_message(self.kuka_socket, timeout=1.0)
                         self.kuka_socket.settimeout(None)
                         
-                        if pose_response.startswith("POSE:"):
-                            # Parse current pose
+                        if pose_response and pose_response.startswith("POSE:"):
                             pose_str = pose_response.split("POSE:")[1].strip()
                             current_pose = np.array([float(x) for x in pose_str.split(",")])
                             t_condition = 0.5  # Use current time in trajectory (normalized)
                             y_condition = current_pose
+                            self.get_logger().info(f'Got current pose for conditioning: {current_pose}')
                         else:
                             # Fallback: use mid-trajectory point
                             t_condition = 0.5
                             y_condition = trajectory[int(num_points * t_condition)]
+                            self.get_logger().warn('Could not get current pose, using mid-trajectory point')
                     except Exception as e:
                         self.get_logger().warn(f'Could not get current pose: {e}, using mid-trajectory point')
                         t_condition = 0.5
@@ -518,15 +564,21 @@ class StandaloneDeformationController(Node):
                     
                     # Generate new trajectory based on deformation energy
                     try:
+                        new_traj = None
                         if self.promp is not None:
                             if energy < self.energy_threshold:
-                                self.get_logger().info('Triggering ProMP conditioning (low energy)')
+                                # Low energy: use ProMP conditioning
+                                self.get_logger().info(f'Energy {energy:.4f} < threshold {self.energy_threshold} - Triggering ProMP conditioning')
                                 self.promp.condition_on_waypoint(t_condition, y_condition)
                                 new_traj = self.promp.generate_trajectory(num_points=num_points)
+                                self.conditioning_count += 1
+                                self.conditioning_status_pub.publish(String(data='CONDITIONING_COMPLETED'))
                             else:
-                                self.get_logger().info('Triggering stepwise EM update (high energy)')
+                                # High energy: use stepwise EM update
+                                self.get_logger().info(f'Energy {energy:.4f} >= threshold {self.energy_threshold} - Triggering stepwise EM update')
                                 em_learner = StepwiseEMLearner(self.promp)
                                 new_traj = em_learner.update_and_generate(trajectory, latest)
+                                self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
                         else:
                             # No ProMP available - use trajectory deformer
                             self.get_logger().info('Using trajectory deformer (no ProMP available)')
@@ -538,18 +590,28 @@ class StandaloneDeformationController(Node):
                                 self.get_logger().warn('Deformation failed, keeping current trajectory')
                                 new_traj = trajectory
                         
-                        # Update trajectory and send to robot
-                        trajectory = new_traj
-                        self.current_trajectory = new_traj
-                        self.deformer.set_trajectory(new_traj)
-                        
-                        # Send new trajectory (non-blocking)
-                        self.send_trajectory_to_kuka_async(new_traj)
-                        self.get_logger().info('Sent new trajectory to robot after deformation')
-                        
-                        last_deformation_time = current_time
-                        self.deformation_count += 1
-                        self.total_energy += energy
+                        if new_traj is not None:
+                            # Update trajectory and send to robot
+                            trajectory = new_traj
+                            self.current_trajectory = new_traj
+                            self.deformer.set_trajectory(new_traj)
+                            
+                            # Restart trajectory execution with new trajectory
+                            trajectory_executing.set()  # Reset flag
+                            execution_thread = threading.Thread(
+                                target=execute_trajectory_with_monitoring, 
+                                args=(new_traj,)
+                            )
+                            execution_thread.daemon = True
+                            execution_thread.start()
+                            self.get_logger().info('Sent new trajectory to robot after deformation')
+                            
+                            last_deformation_time = current_time
+                            self.deformation_count += 1
+                            self.total_energy += energy
+                            self.energy_pub.publish(Float64(data=energy))
+                        else:
+                            self.get_logger().error('Failed to generate new trajectory')
                         
                     except Exception as e:
                         self.get_logger().error(f'Error generating new trajectory: {e}')
@@ -558,8 +620,13 @@ class StandaloneDeformationController(Node):
             
             time.sleep(dt)
         
+        # Wait for execution thread to finish
+        if execution_thread is not None:
+            execution_thread.join(timeout=5.0)
+        
         self.is_executing = False
         self.get_logger().info('Trajectory execution finished')
+        self.execution_status_pub.publish(String(data='EXECUTION_STOPPED'))
     
     def stop_execution(self):
         """Stop trajectory execution"""
@@ -731,6 +798,85 @@ class StandaloneDeformationController(Node):
             if not complete:
                 self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors: {error_count}')
                 return point_count > 0  # Return True if some progress made
+            
+        except Exception as e:
+            self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return False
+    
+    def send_trajectory_to_kuka_with_interrupt(self, trajectory, interrupt_event):
+        """Send trajectory to KUKA robot and monitor execution, can be interrupted
+        Similar to send_trajectory_to_kuka but checks interrupt_event to allow stopping"""
+        if self.kuka_socket is None:
+            self.get_logger().error('No connection to KUKA robot')
+            return False
+        
+        try:
+            # Validate trajectory format
+            traj_array = np.array(trajectory)
+            if traj_array.ndim != 2 or traj_array.shape[1] != 6:
+                self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
+                return False
+            
+            # Convert Cartesian to joint positions using pybullet IK
+            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
+            joint_trajectory = self.cartesian_to_joint_python(trajectory)
+            
+            if joint_trajectory is None or len(joint_trajectory) == 0:
+                self.get_logger().error('Failed to convert trajectory to joint positions')
+                self.get_logger().error('Please install pybullet: pip install pybullet')
+                return False
+            
+            # Store joint trajectory
+            self.current_joint_trajectory = joint_trajectory
+            
+            # Format joint trajectory for KUKA
+            trajectory_str = ";".join([
+                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
+            ])
+            
+            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
+            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
+            self.kuka_socket.sendall(command.encode('utf-8'))
+            
+            # Monitor execution progress, checking for interrupt
+            complete = False
+            point_count = 0
+            error_count = 0
+            
+            while not complete and interrupt_event.is_set():
+                # Use shorter timeout to check interrupt more frequently
+                response = self._receive_complete_message(self.kuka_socket, timeout=1.0)
+                if not response:
+                    # Timeout - check if we should continue
+                    if not interrupt_event.is_set():
+                        self.get_logger().info('Trajectory execution interrupted by deformation request')
+                        return False
+                    continue
+                
+                response = response.strip()
+                
+                if "TRAJECTORY_COMPLETE" in response:
+                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count}, Errors (skipped): {error_count}')
+                    complete = True
+                    return True
+                elif "ERROR" in response:
+                    error_count += 1
+                    self.get_logger().warn(f'Point execution error (skipping): {response}')
+                elif "POINT_COMPLETE" in response:
+                    point_count += 1
+                    if point_count % 10 == 0:
+                        self.get_logger().info(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
+            
+            if not complete and not interrupt_event.is_set():
+                self.get_logger().info('Trajectory execution interrupted')
+                return False
+            elif not complete:
+                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors: {error_count}')
+                return point_count > 0
+            
+            return True
             
         except Exception as e:
             self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
