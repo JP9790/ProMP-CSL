@@ -1,0 +1,9 @@
+[ERROR] [1770765012.183224853] [standalone_deformation_controller]: Error generating new trajectory: could not broadcast input array from shape (10,10) into shape (10,)
+[ERROR] [1770765012.185257257] [standalone_deformation_controller]: Traceback (most recent call last):
+  File "/home/qxa5031/ros2_22/install/kuka_promp_control/lib/python3.12/site-packages/kuka_promp_control/standalone_deformation_controller.py", line 586, in execution_loop
+    deformed_traj, _, _ = self.deformer.deform(human_input)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/qxa5031/ros2_22/install/kuka_promp_control/lib/python3.12/site-packages/kuka_promp_control/trajectory_deformer.py", line 85, in deform
+    gamma[:, dim] = self.alpha * np.dot(self.H, u_h[dim])
+    ~~~~~^^^^^^^^
+ValueError: could not broadcast input array from shape (10,10) into shape (10,)
