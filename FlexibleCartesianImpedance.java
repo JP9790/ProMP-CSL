@@ -323,8 +323,27 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 // Create Frame for Cartesian motion
                 Frame targetFrame = new Frame(x, y, z, alpha, beta, gamma);
                 
-                // Create impedance mode for this motion (allows parameter updates during execution)
+                // Create impedance mode for this motion with configured parameters
+                // Read parameters with synchronization (may have been updated)
+                double sx, sy, sz, srot, damp;
+                synchronized (this) {
+                    sx = stiffnessX;
+                    sy = stiffnessY;
+                    sz = stiffnessZ;
+                    srot = stiffnessRot;
+                    damp = damping;
+                }
+                
                 CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
+                // Set stiffness parameters for Cartesian impedance control
+                currentImpedanceMode.setStiffnessX(sx);
+                currentImpedanceMode.setStiffnessY(sy);
+                currentImpedanceMode.setStiffnessZ(sz);
+                currentImpedanceMode.setStiffnessRotX(srot);
+                currentImpedanceMode.setStiffnessRotY(srot);
+                currentImpedanceMode.setStiffnessRotZ(srot);
+                // Set damping parameter
+                currentImpedanceMode.setDamping(damp);
                 
                 // Cancel PositionHold before executing trajectory point
                 if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
@@ -333,6 +352,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 
                 // Execute LIN motion with impedance control for compliance
                 // Robot remains compliant during motion for physical interaction
+                // With configured stiffness values, robot can be pushed/deformed during execution
                 currentMotion = robot.moveAsync(lin(targetFrame).setMode(currentImpedanceMode));
                 
                 // Monitor execution and allow external force deformation
