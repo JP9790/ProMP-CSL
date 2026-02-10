@@ -377,31 +377,66 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     // Robot remains compliant during motion for physical interaction
                     // With configured stiffness values, robot can be pushed/deformed during execution
                     // Note: Workspace errors will be caught and point will be skipped
-                    currentMotion = robot.moveAsync(lin(targetFrame).setMode(currentImpedanceMode));
+                    // moveAsync can throw exceptions immediately if motion cannot be planned
+                    try {
+                        currentMotion = robot.moveAsync(lin(targetFrame).setMode(currentImpedanceMode));
+                    } catch (Exception moveEx) {
+                        // moveAsync threw exception immediately - likely workspace error
+                        // Re-throw to be caught by outer catch block
+                        throw moveEx;
+                    }
                     
                     // Monitor execution and allow external force deformation
-                    while (!currentMotion.isFinished() && !stopRequested.get()) {
-                        try {
-                            // Check stop flag frequently during motion
-                            if (stopRequested.get()) {
-                                currentMotion.cancel();
+                    // Also catch any exceptions that occur during motion execution
+                    try {
+                        while (!currentMotion.isFinished() && !stopRequested.get()) {
+                            try {
+                                // Check stop flag frequently during motion
+                                if (stopRequested.get()) {
+                                    currentMotion.cancel();
+                                    break;
+                                }
+                                
+                                // Monitor external forces for deformation detection
+                                // In impedance mode, the robot will naturally respond to external forces
+                                // Force data is sent continuously by background thread, no need to send here
+                                
+                                // Small delay to allow external force response and command processing
+                                Thread.sleep(50); // 20 Hz monitoring
+                                
+                            } catch (InterruptedException e) {
+                                getLogger().info("Motion monitoring interrupted");
+                                break;
+                            } catch (Exception e) {
+                                // Check if this is a workspace error during execution
+                                String execError = e.getMessage();
+                                if (execError != null && (execError.contains("Arbeitsraumfehler") || 
+                                    execError.contains("workspace"))) {
+                                    getLogger().warn("Workspace error during motion execution for point " + i);
+                                    // Cancel motion and re-throw to be caught by outer catch
+                                    if (currentMotion != null && !currentMotion.isFinished()) {
+                                        try {
+                                            currentMotion.cancel();
+                                        } catch (Exception cancelEx) {
+                                            // Ignore cancellation errors
+                                        }
+                                    }
+                                    throw e; // Re-throw to outer catch block
+                                }
+                                getLogger().error("Error during force monitoring: " + e.getMessage());
                                 break;
                             }
-                            
-                            // Monitor external forces for deformation detection
-                            // In impedance mode, the robot will naturally respond to external forces
-                            // Force data is sent continuously by background thread, no need to send here
-                            
-                            // Small delay to allow external force response and command processing
-                            Thread.sleep(50); // 20 Hz monitoring
-                            
-                        } catch (InterruptedException e) {
-                            getLogger().info("Motion monitoring interrupted");
-                            break;
-                        } catch (Exception e) {
-                            getLogger().error("Error during force monitoring: " + e.getMessage());
-                            break;
                         }
+                    } catch (Exception execEx) {
+                        // Exception during motion execution - check if it's a workspace error
+                        String execError = execEx.getMessage();
+                        if (execError != null && (execError.contains("Arbeitsraumfehler") || 
+                            execError.contains("workspace"))) {
+                            // Re-throw to outer catch block to handle as workspace error
+                            throw execEx;
+                        }
+                        // For other execution errors, log and continue
+                        getLogger().warn("Motion execution error for point " + i + ": " + execEx.getMessage());
                     }
                     
                     // Check stop flag before moving to next point
@@ -410,28 +445,99 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                         break;
                     }
                     
-                    // Thread-safe output - only send POINT_COMPLETE if motion completed successfully
+                    // Only send POINT_COMPLETE if motion completed successfully
+                    // Check if motion actually finished successfully
+                    if (currentMotion != null && currentMotion.isFinished()) {
+                        // Thread-safe output - only send POINT_COMPLETE if motion completed successfully
+                        synchronized (outputLock) {
+                            if (out != null) {
+                                out.println("POINT_COMPLETE");
+                            }
+                        }
+                    } else {
+                        // Motion didn't complete - might have been cancelled or failed
+                        getLogger().warn("Point " + i + " motion did not complete successfully");
+                    }
+                    
+                } catch (RuntimeException re) {
+                    // Catch runtime exceptions (KUKA often throws these for workspace errors)
+                    String errorMsg = re.getMessage();
+                    String errorType = "UNKNOWN";
+                    String fullError = errorMsg != null ? errorMsg : re.getClass().getSimpleName();
+                    
+                    // Check exception class name and message
+                    String exceptionClass = re.getClass().getSimpleName();
+                    String causeMsg = "";
+                    if (re.getCause() != null && re.getCause().getMessage() != null) {
+                        causeMsg = re.getCause().getMessage();
+                        fullError = (errorMsg != null ? errorMsg : "") + " (Cause: " + causeMsg + ")";
+                    }
+                    
+                    // Check for workspace errors in multiple ways
+                    boolean isWorkspaceError = false;
+                    if (errorMsg != null) {
+                        isWorkspaceError = errorMsg.contains("Arbeitsraumfehler") || 
+                                          errorMsg.contains("workspace") ||
+                                          errorMsg.contains("Arbeitsraum");
+                    }
+                    if (!isWorkspaceError && causeMsg != null && !causeMsg.isEmpty()) {
+                        isWorkspaceError = causeMsg.contains("Arbeitsraumfehler") || 
+                                         causeMsg.contains("workspace") ||
+                                         causeMsg.contains("Arbeitsraum");
+                    }
+                    if (!isWorkspaceError) {
+                        isWorkspaceError = exceptionClass.contains("Workspace") || 
+                                         exceptionClass.contains("Arbeitsraum");
+                    }
+                    
+                    if (isWorkspaceError) {
+                        errorType = "WORKSPACE_ERROR";
+                        getLogger().warn("Point " + i + " is outside workspace - skipping. Position: x=" + 
+                            String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
+                        getLogger().warn("Exception type: " + exceptionClass + ", Message: " + fullError);
+                    } else if (errorMsg != null && (errorMsg.contains("axis limit violation") || errorMsg.contains("software axis limit"))) {
+                        errorType = "AXIS_LIMIT_VIOLATION";
+                        getLogger().warn("Point " + i + " violates axis limits - skipping. Position: x=" + 
+                            String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
+                    } else if (errorMsg != null && (errorMsg.contains("can not plan motion") || errorMsg.contains("cannot plan"))) {
+                        errorType = "MOTION_PLANNING_ERROR";
+                        getLogger().warn("Point " + i + " cannot be planned - skipping. Position: x=" + 
+                            String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
+                    } else {
+                        getLogger().warn("Point " + i + " execution failed (RuntimeException): " + fullError + " (Class: " + exceptionClass + ")");
+                    }
+                    
+                    // Send error message to Python so it can skip this point
                     synchronized (outputLock) {
                         if (out != null) {
-                            out.println("POINT_COMPLETE");
+                            out.println("ERROR:" + errorType + "_POINT_" + i + ":" + fullError);
                         }
                     }
                     
+                    // Continue to next point instead of breaking
+                    // The trajectory will continue with remaining reachable points
+                    continue;
+                    
                 } catch (Exception e) {
-                    // Catch workspace errors, axis limit violations, and other exceptions for this specific point
+                    // Catch all other exceptions for this specific point
                     String errorMsg = e.getMessage();
                     String errorType = "UNKNOWN";
-                    String fullError = errorMsg;
+                    String fullError = errorMsg != null ? errorMsg : e.getClass().getSimpleName();
                     
                     // Get full exception details for better debugging
-                    if (e.getCause() != null) {
-                        fullError = errorMsg + " (Cause: " + e.getCause().getMessage() + ")";
+                    if (e.getCause() != null && e.getCause().getMessage() != null) {
+                        fullError = (errorMsg != null ? errorMsg : "") + " (Cause: " + e.getCause().getMessage() + ")";
                     }
+                    
+                    // Check exception class name and message
+                    String exceptionClass = e.getClass().getSimpleName();
+                    String causeMsg = (e.getCause() != null && e.getCause().getMessage() != null) ? 
+                                     e.getCause().getMessage() : "";
                     
                     if (errorMsg != null) {
                         if (errorMsg.contains("Arbeitsraumfehler") || errorMsg.contains("workspace") || 
-                            (e.getCause() != null && e.getCause().getMessage() != null && 
-                             e.getCause().getMessage().contains("Arbeitsraumfehler"))) {
+                            causeMsg.contains("Arbeitsraumfehler") || causeMsg.contains("workspace") ||
+                            exceptionClass.contains("Workspace") || exceptionClass.contains("Arbeitsraum")) {
                             errorType = "WORKSPACE_ERROR";
                             getLogger().warn("Point " + i + " is outside workspace - skipping. Position: x=" + 
                                 String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
@@ -444,10 +550,10 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                             getLogger().warn("Point " + i + " cannot be planned - skipping. Position: x=" + 
                                 String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
                         } else {
-                            getLogger().warn("Point " + i + " execution failed: " + fullError);
+                            getLogger().warn("Point " + i + " execution failed: " + fullError + " (Class: " + exceptionClass + ")");
                         }
                     } else {
-                        getLogger().warn("Point " + i + " execution failed with unknown error: " + e.getClass().getSimpleName());
+                        getLogger().warn("Point " + i + " execution failed with unknown error: " + exceptionClass);
                     }
                     
                     // Send error message to Python so it can skip this point
