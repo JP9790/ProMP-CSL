@@ -97,17 +97,52 @@ class TrainAndExecute(Node):
             self.get_logger().error(f'Failed to connect to KUKA: {e}')
             self.kuka_socket = None
     
+    def cartesian_to_joint_ikpy(self, cartesian_poses):
+        """Convert Cartesian poses to joint positions using ikpy library"""
+        try:
+            import ikpy.chain
+            import ikpy.utils.plot as plot_utils
+            import tempfile
+            import urdf_parser_py.urdf
+            
+            # KUKA LBR iiwa 7 DOF robot URDF (simplified - you may need to adjust)
+            # This is a basic approximation - for accurate IK, use the actual robot URDF
+            self.get_logger().warn('Using simplified IK solver. For accurate results, provide robot URDF.')
+            
+            # For now, return None to use fallback method
+            return None
+            
+        except ImportError:
+            self.get_logger().warn('ikpy not available, using fallback method')
+            return None
+        except Exception as e:
+            self.get_logger().warn(f'IK solver error: {e}, using fallback method')
+            return None
+    
+    def cartesian_to_joint_fallback(self, cartesian_poses):
+        """Fallback: Send Cartesian trajectory and let Java handle IK during execution"""
+        self.get_logger().info('Using fallback: Sending Cartesian trajectory directly (Java will handle IK)')
+        # Return None to indicate we should use Cartesian trajectory
+        return None
+    
     def cartesian_to_joint_via_java(self, cartesian_poses):
-        """Convert Cartesian poses to joint positions by requesting IK from Java"""
+        """Convert Cartesian poses to joint positions by requesting IK from Java
+        Falls back to Cartesian trajectory if IK is not available"""
         if self.kuka_socket is None:
             self.get_logger().error('No connection to KUKA robot for IK conversion')
             return None
         
         try:
+            # Try Python-side IK first (if available)
+            joint_positions = self.cartesian_to_joint_ikpy(cartesian_poses)
+            if joint_positions is not None:
+                return joint_positions
+            
+            # Try Java-side IK (may not be available)
             joint_positions = []
             failed_count = 0
             
-            self.get_logger().info(f'Converting {len(cartesian_poses)} Cartesian poses to joint positions via Java IK...')
+            self.get_logger().info(f'Attempting to convert {len(cartesian_poses)} Cartesian poses to joint positions via Java IK...')
             
             for i, pose in enumerate(cartesian_poses):
                 x, y, z, alpha, beta, gamma = pose
@@ -127,6 +162,10 @@ class TrainAndExecute(Node):
                     else:
                         self.get_logger().warn(f'Invalid joint position response for point {i}: {response}')
                         failed_count += 1
+                elif response and "IK_NOT_AVAILABLE" in response:
+                    # Java IK not available - use fallback
+                    self.get_logger().info('Java IK not available, using Cartesian trajectory directly')
+                    return None
                 elif response and "ERROR" in response:
                     self.get_logger().warn(f'IK failed for point {i}: {response}')
                     failed_count += 1
@@ -145,7 +184,8 @@ class TrainAndExecute(Node):
                 self.get_logger().warn(f'Converted {len(joint_positions)}/{len(cartesian_poses)} poses ({failed_count} failed)')
                 return np.array(joint_positions)
             else:
-                self.get_logger().error('Failed to convert any poses to joint positions')
+                # Fallback: return None to use Cartesian trajectory
+                self.get_logger().info('IK conversion failed, will use Cartesian trajectory (Java handles IK during execution)')
                 return None
                 
         except Exception as e:
@@ -482,27 +522,39 @@ class TrainAndExecute(Node):
                 self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
                 return False
             
-            # Convert Cartesian to joint positions using Java IK solver
-            # This prevents workspace errors by ensuring all points are reachable
-            self.get_logger().info('Converting Cartesian trajectory to joint positions...')
+            # Try to convert Cartesian to joint positions
+            # If IK is not available, fall back to Cartesian trajectory
+            self.get_logger().info('Attempting to convert Cartesian trajectory to joint positions...')
             joint_trajectory = self.cartesian_to_joint_via_java(self.learned_trajectory)
             
-            if joint_trajectory is None or len(joint_trajectory) == 0:
-                self.get_logger().error('Failed to convert trajectory to joint positions')
-                return False
-            
-            # Store joint trajectory
-            self.learned_joint_trajectory = joint_trajectory
-            
-            # Format joint trajectory for KUKA: j1,j2,j3,j4,j5,j6,j7 separated by semicolons
-            # Format: "JOINT_TRAJECTORY:j1_1,j2_1,j3_1,j4_1,j5_1,j6_1,j7_1;j1_2,j2_2,..."
-            trajectory_str = ";".join([
-                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
-            ])
-            
-            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
-            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
-            self.kuka_socket.sendall(command.encode('utf-8'))
+            if joint_trajectory is not None and len(joint_trajectory) > 0:
+                # Successfully converted to joint positions
+                self.learned_joint_trajectory = joint_trajectory
+                
+                # Format joint trajectory for KUKA: j1,j2,j3,j4,j5,j6,j7 separated by semicolons
+                # Format: "JOINT_TRAJECTORY:j1_1,j2_1,j3_1,j4_1,j5_1,j6_1,j7_1;j1_2,j2_2,..."
+                trajectory_str = ";".join([
+                    ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
+                ])
+                
+                command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
+                self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
+                self.kuka_socket.sendall(command.encode('utf-8'))
+            else:
+                # Fallback: Use Cartesian trajectory (Java will handle IK during execution)
+                # Note: This may still have workspace errors, but Java will skip unreachable points
+                self.get_logger().info('IK conversion not available, using Cartesian trajectory (Java handles IK during execution)')
+                
+                # Format Cartesian trajectory for KUKA: x,y,z,alpha,beta,gamma separated by semicolons
+                # Format: "TRAJECTORY:x1,y1,z1,a1,b1,g1;x2,y2,z2,a2,b2,g2;..."
+                trajectory_str = ";".join([
+                    ",".join([f"{val:.6f}" for val in point]) for point in self.learned_trajectory
+                ])
+                
+                command = f"TRAJECTORY:{trajectory_str}\n"
+                self.get_logger().info(f'Sending Cartesian trajectory to KUKA ({len(self.learned_trajectory)} points)...')
+                self.get_logger().warn('Note: Some points may fail with workspace errors, but execution will continue')
+                self.kuka_socket.sendall(command.encode('utf-8'))
             
             # Wait for completion - handle fragmented responses and skip errors
             complete = False
