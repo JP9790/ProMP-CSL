@@ -343,7 +343,12 @@ class InteractiveDemoRecorder(Node):
         csv_filename = os.path.join(self.save_directory, f'demo_{demo_number:03d}.csv')
         try:
             np.save(npy_filename, np.array(demo_data))
-            np.savetxt(csv_filename, np.array(demo_data), delimiter=',')
+            
+            # Save CSV with column headers
+            # Format: x (m), y (m), z (m), alpha (rad), beta (rad), gamma (rad)
+            header = 'x_m,y_m,z_m,alpha_rad,beta_rad,gamma_rad'
+            np.savetxt(csv_filename, np.array(demo_data), delimiter=',', 
+                      header=header, comments='', fmt='%.6f')
             self.get_logger().info(f'Individual demo saved to: {npy_filename} and {csv_filename}')
             return npy_filename, csv_filename
         except Exception as e:
