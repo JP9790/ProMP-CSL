@@ -113,28 +113,6 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         try {
             serverSocket = new ServerSocket(30002);
             getLogger().info("All-in-one server started on port 30002");
-            
-            // Setup force data connection to Python controller
-            try {
-                forceDataSocket = new Socket(ros2PCIP, 30003); // Python controller IP and port
-                forceDataOut = new PrintWriter(forceDataSocket.getOutputStream(), true);
-                getLogger().info("Force data connection established to Python controller");
-                
-                // Start continuous force data sending thread
-                forceDataThreadRunning.set(true);
-                Thread forceDataThread = new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        continuousForceDataSender();
-                    }
-                });
-                forceDataThread.setDaemon(true);
-                forceDataThread.start();
-                getLogger().info("Force data sending thread started");
-            } catch (IOException e) {
-                getLogger().warn("Could not connect to Python controller for force data: " + e.getMessage());
-                getLogger().info("Force data will be logged locally only");
-            }
         } catch (IOException e) {
             getLogger().error("Could not start server socket: " + e.getMessage());
         }
@@ -149,6 +127,10 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             out = new PrintWriter(clientSocket.getOutputStream(), true);
             out.println("READY");
             getLogger().info("Python client connected: " + clientSocket.getInetAddress());
+            
+            // Setup force data connection to Python controller AFTER Python client connects
+            // This ensures Python server on port 30003 is ready
+            setupForceDataConnection();
 
             String line;
             while ((line = in.readLine()) != null) {
@@ -192,6 +174,60 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         }
     }
 
+    /**
+     * Setup force data connection to Python controller
+     * Called after Python client connects to ensure Python server is ready
+     */
+    private void setupForceDataConnection() {
+        // Wait a bit for Python server to be ready
+        try {
+            Thread.sleep(1000); // Give Python 1 second to set up server
+        } catch (InterruptedException e) {
+            // Continue anyway
+        }
+        
+        // Try to connect with retries
+        int maxRetries = 5;
+        int retryDelay = 1000; // 1 second between retries
+        
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                getLogger().info("Attempting to connect to Python force data server (attempt " + attempt + "/" + maxRetries + ")...");
+                forceDataSocket = new Socket(ros2PCIP, 30003); // Python controller IP and port
+                forceDataSocket.setSoTimeout(5000); // 5 second timeout for operations
+                forceDataOut = new PrintWriter(forceDataSocket.getOutputStream(), true);
+                getLogger().info("Force data connection established to Python controller");
+                
+                // Start continuous force data sending thread
+                forceDataThreadRunning.set(true);
+                Thread forceDataThread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        continuousForceDataSender();
+                    }
+                });
+                forceDataThread.setDaemon(true);
+                forceDataThread.start();
+                getLogger().info("Force data sending thread started");
+                return; // Success, exit retry loop
+                
+            } catch (IOException e) {
+                if (attempt < maxRetries) {
+                    getLogger().warn("Could not connect to Python controller for force data (attempt " + attempt + "): " + e.getMessage());
+                    getLogger().info("Retrying in " + (retryDelay/1000) + " seconds...");
+                    try {
+                        Thread.sleep(retryDelay);
+                    } catch (InterruptedException ie) {
+                        break;
+                    }
+                } else {
+                    getLogger().warn("Could not connect to Python controller for force data after " + maxRetries + " attempts: " + e.getMessage());
+                    getLogger().info("Force data will be logged locally only");
+                }
+            }
+        }
+    }
+    
     private List<double[]> parseTrajectory(String trajStr) {
         List<double[]> trajectory = new ArrayList<double[]>();
         String[] points = trajStr.split(";");
