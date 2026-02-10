@@ -7,6 +7,7 @@ import numpy as np
 import socket
 import time
 import matplotlib.pyplot as plt
+import os
 from .promp import ProMP
 import argparse
 
@@ -20,7 +21,8 @@ class TrainAndExecute(Node):
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('num_basis_functions', 50)
         self.declare_parameter('sigma_noise', 0.01)
-        self.declare_parameter('demo_file', 'all_demos.npy')  # Default matches interactive_demo_recorder.py output
+        self.declare_parameter('save_directory', '~/robot_demos')  # Default matches interactive_demo_recorder.py
+        self.declare_parameter('demo_file', '')  # Empty means use save_directory/all_demos.npy
         self.declare_parameter('trajectory_points', 100)
         
         # Get parameters
@@ -28,8 +30,27 @@ class TrainAndExecute(Node):
         self.kuka_port = self.get_parameter('kuka_port').value
         self.num_basis = self.get_parameter('num_basis_functions').value
         self.sigma_noise = self.get_parameter('sigma_noise').value
-        self.demo_file = self.get_parameter('demo_file').value
+        self.save_directory = os.path.expanduser(self.get_parameter('save_directory').value)
+        demo_file_param = self.get_parameter('demo_file').value
         self.trajectory_points = self.get_parameter('trajectory_points').value
+        
+        # Set demo_file path - use save_directory if demo_file is empty or relative
+        if demo_file_param:
+            if os.path.isabs(demo_file_param):
+                # Absolute path provided
+                self.demo_file = demo_file_param
+            else:
+                # Relative path - check if it exists in current dir, otherwise use save_directory
+                if os.path.exists(demo_file_param):
+                    self.demo_file = demo_file_param
+                else:
+                    self.demo_file = os.path.join(self.save_directory, demo_file_param)
+        else:
+            # Default: use save_directory/all_demos.npy
+            self.demo_file = os.path.join(self.save_directory, 'all_demos.npy')
+        
+        self.get_logger().info(f'Demo file path: {self.demo_file}')
+        self.get_logger().info(f'Save directory: {self.save_directory}')
         
         # ProMP and trajectory
         self.promp = None
@@ -156,6 +177,9 @@ class TrainAndExecute(Node):
         except FileNotFoundError:
             self.get_logger().error(f'Demo file not found: {self.demo_file}')
             self.get_logger().info('Make sure you have recorded demos using interactive_demo_recorder.py first')
+            self.get_logger().info(f'Expected location: {self.demo_file}')
+            self.get_logger().info(f'Save directory: {self.save_directory}')
+            self.get_logger().info('You can specify a different path using --demo-file argument')
             self.demos = []
         except Exception as e:
             self.get_logger().error(f'Error loading demos: {e}')
@@ -379,7 +403,8 @@ def main(args=None):
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train ProMP and execute trajectory')
-    parser.add_argument('--demo-file', default='all_demos.npy', help='Demo file path (default: all_demos.npy from interactive_demo_recorder)')
+    parser.add_argument('--demo-file', default='', help='Demo file path (default: ~/robot_demos/all_demos.npy from interactive_demo_recorder)')
+    parser.add_argument('--save-directory', default='~/robot_demos', help='Directory where demos are saved (default: ~/robot_demos)')
     parser.add_argument('--kuka-ip', default='172.31.1.147', help='KUKA robot IP (default: 172.31.1.147)')
     parser.add_argument('--train-only', action='store_true', help='Only train ProMP, do not execute')
     parser.add_argument('--execute-only', action='store_true', help='Only execute, do not train')
@@ -390,6 +415,25 @@ def main(args=None):
     
     # Create node with parameters
     node = TrainAndExecute()
+    
+    # Override demo_file and save_directory if provided via command line
+    if args.save_directory:
+        node.save_directory = os.path.expanduser(args.save_directory)
+        # Update demo_file path if it was using default
+        if not args.demo_file:
+            node.demo_file = os.path.join(node.save_directory, 'all_demos.npy')
+    
+    if args.demo_file:
+        # Use provided demo file path
+        if os.path.isabs(args.demo_file):
+            node.demo_file = args.demo_file
+        else:
+            # Try current directory first, then save_directory
+            if os.path.exists(args.demo_file):
+                node.demo_file = args.demo_file
+            else:
+                node.demo_file = os.path.join(node.save_directory, args.demo_file)
+        node.get_logger().info(f'Using demo file from command line: {node.demo_file}')
     
     try:
         if args.load_trajectory:
