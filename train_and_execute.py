@@ -253,13 +253,26 @@ class TrainAndExecute(Node):
         return normalized_scaled
     
     def denormalize_trajectory(self, trajectory):
-        """Denormalize trajectory from [0,1] range back to original demo range"""
+        """Denormalize trajectory from [0,1] range back to original demo range
+        and clip to ensure it stays within demo bounds"""
         if self.demo_min is None or self.demo_max is None:
             self.get_logger().error('Cannot denormalize: demo statistics not computed')
             return trajectory
         
+        # First, clip normalized trajectory to [0, 1] to prevent ProMP from generating out-of-bounds values
+        trajectory_clipped = np.clip(trajectory, 0.0, 1.0)
+        
+        # Check if clipping was needed
+        if not np.array_equal(trajectory, trajectory_clipped):
+            clipped_count = np.sum(trajectory != trajectory_clipped)
+            self.get_logger().warn(f'Clipped {clipped_count} values in normalized trajectory to [0,1] range')
+        
         # Denormalize: value * (max - min) + min
-        trajectory_denorm = trajectory * (self.demo_max - self.demo_min) + self.demo_min
+        trajectory_denorm = trajectory_clipped * (self.demo_max - self.demo_min) + self.demo_min
+        
+        # Double-check: clip denormalized trajectory to demo bounds as safety measure
+        trajectory_denorm = np.clip(trajectory_denorm, self.demo_min, self.demo_max)
+        
         return trajectory_denorm
     
     def train_promp(self):
@@ -302,16 +315,31 @@ class TrainAndExecute(Node):
                 trajectory_normalized = np.mean(trajectories, axis=0)
                 self.get_logger().info(f'Generated {num_samples} trajectories and computed mean')
             
-            # Denormalize trajectory back to original scale
+            # Denormalize trajectory back to original scale (with clipping to stay within bounds)
             self.learned_trajectory = self.denormalize_trajectory(trajectory_normalized)
             
+            # Verify trajectory is within demo bounds
+            out_of_bounds = False
+            for dim in range(6):
+                dim_min = np.min(self.learned_trajectory[:, dim])
+                dim_max = np.max(self.learned_trajectory[:, dim])
+                demo_min = self.demo_min[dim]
+                demo_max = self.demo_max[dim]
+                
+                if dim_min < demo_min or dim_max > demo_max:
+                    out_of_bounds = True
+                    self.get_logger().warn(f'Dimension {dim} out of bounds: [{dim_min:.3f}, {dim_max:.3f}] vs demo range [{demo_min:.3f}, {demo_max:.3f}]')
+            
+            if not out_of_bounds:
+                self.get_logger().info('Trajectory is within demo bounds ✓')
+            
             self.get_logger().info(f'Trajectory denormalized, range:')
-            self.get_logger().info(f'  X: [{np.min(self.learned_trajectory[:, 0]):.3f}, {np.max(self.learned_trajectory[:, 0]):.3f}] m')
-            self.get_logger().info(f'  Y: [{np.min(self.learned_trajectory[:, 1]):.3f}, {np.max(self.learned_trajectory[:, 1]):.3f}] m')
-            self.get_logger().info(f'  Z: [{np.min(self.learned_trajectory[:, 2]):.3f}, {np.max(self.learned_trajectory[:, 2]):.3f}] m')
-            self.get_logger().info(f'  Alpha: [{np.min(self.learned_trajectory[:, 3]):.3f}, {np.max(self.learned_trajectory[:, 3]):.3f}] rad')
-            self.get_logger().info(f'  Beta: [{np.min(self.learned_trajectory[:, 4]):.3f}, {np.max(self.learned_trajectory[:, 4]):.3f}] rad')
-            self.get_logger().info(f'  Gamma: [{np.min(self.learned_trajectory[:, 5]):.3f}, {np.max(self.learned_trajectory[:, 5]):.3f}] rad')
+            self.get_logger().info(f'  X: [{np.min(self.learned_trajectory[:, 0]):.3f}, {np.max(self.learned_trajectory[:, 0]):.3f}] m (demo: [{self.demo_min[0]:.3f}, {self.demo_max[0]:.3f}])')
+            self.get_logger().info(f'  Y: [{np.min(self.learned_trajectory[:, 1]):.3f}, {np.max(self.learned_trajectory[:, 1]):.3f}] m (demo: [{self.demo_min[1]:.3f}, {self.demo_max[1]:.3f}])')
+            self.get_logger().info(f'  Z: [{np.min(self.learned_trajectory[:, 2]):.3f}, {np.max(self.learned_trajectory[:, 2]):.3f}] m (demo: [{self.demo_min[2]:.3f}, {self.demo_max[2]:.3f}])')
+            self.get_logger().info(f'  Alpha: [{np.min(self.learned_trajectory[:, 3]):.3f}, {np.max(self.learned_trajectory[:, 3]):.3f}] rad (demo: [{self.demo_min[3]:.3f}, {self.demo_max[3]:.3f}])')
+            self.get_logger().info(f'  Beta: [{np.min(self.learned_trajectory[:, 4]):.3f}, {np.max(self.learned_trajectory[:, 4]):.3f}] rad (demo: [{self.demo_min[4]:.3f}, {self.demo_max[4]:.3f}])')
+            self.get_logger().info(f'  Gamma: [{np.min(self.learned_trajectory[:, 5]):.3f}, {np.max(self.learned_trajectory[:, 5]):.3f}] rad (demo: [{self.demo_min[5]:.3f}, {self.demo_max[5]:.3f}])')
             
             return self.learned_trajectory
             
