@@ -37,6 +37,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private double stiffnessRot = 50.0; // Nm/rad
     private double damping = 0.7; // Damping ratio
     
+    // PositionHold stiffness - small value to hold against gravity while remaining compliant
+    private double positionHoldStiffness = 50.0; // Nm/rad per joint (low enough for compliance, high enough to resist gravity)
+    
     // External torque threshold for human interaction (matching cartesianimpedance.java)
     private double forceThreshold = 10.0; // N
     private double torqueThreshold = 2.0; // Nm
@@ -91,13 +94,17 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         }
         
         // Setup PositionHold with joint impedance control for compliant waiting
-        // This matches cartesianimpedance.java - uses JointImpedanceControlMode with zero stiffness
+        // Use small stiffness to hold against gravity while remaining compliant for physical interaction
         getLogger().info("Setting up PositionHold with impedance control for compliant waiting...");
         try {
-            // Use JointImpedanceControlMode with zero stiffness for compliance (like cartesianimpedance.java)
-            JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-            impedanceMode.setStiffnessForAllJoints(0.0); // Very low stiffness for compliance
-            getLogger().info("JointImpedanceControlMode created successfully");
+            // Use JointImpedanceControlMode with small stiffness to resist gravity but remain compliant
+            // Small stiffness (50 Nm/rad) prevents gravity drift while still allowing physical interaction
+            JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(
+                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, 
+                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, positionHoldStiffness
+            );
+            impedanceMode.setStiffnessForAllJoints(positionHoldStiffness);
+            getLogger().info("JointImpedanceControlMode created with stiffness: " + positionHoldStiffness + " Nm/rad (low enough for compliance, high enough to resist gravity)");
             
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
             getLogger().info("PositionHold created successfully");
@@ -439,7 +446,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     /**
      * Restart PositionHold with joint impedance control to keep robot compliant
      * This ensures the robot is always ready for physical interaction
-     * Uses JointImpedanceControlMode with zero stiffness (like cartesianimpedance.java)
+     * Uses small stiffness to resist gravity while remaining compliant
      */
     private void restartPositionHold() {
         try {
@@ -452,11 +459,15 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 currentMotion.cancel();
             }
             
-            // Use JointImpedanceControlMode with zero stiffness for compliance (like cartesianimpedance.java)
-            JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-            impedanceMode.setStiffnessForAllJoints(0.0); // Very low stiffness for compliance
+            // Use JointImpedanceControlMode with small stiffness to resist gravity but remain compliant
+            // Small stiffness prevents gravity drift while still allowing physical interaction
+            JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(
+                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, 
+                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, positionHoldStiffness
+            );
+            impedanceMode.setStiffnessForAllJoints(positionHoldStiffness);
             
-            getLogger().info("Restarting PositionHold with joint impedance control (zero stiffness)");
+            getLogger().info("Restarting PositionHold with joint impedance control (stiffness: " + positionHoldStiffness + " Nm/rad)");
             
             // Create new PositionHold with joint impedance control
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
@@ -729,6 +740,14 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             stiffnessRot = Double.parseDouble(getApplicationData().getProcessData("stiffness_rot").getValue().toString());
             damping = Double.parseDouble(getApplicationData().getProcessData("damping_ratio").getValue().toString());
         
+            // Load PositionHold stiffness (if available, otherwise use default)
+            try {
+                positionHoldStiffness = Double.parseDouble(getApplicationData().getProcessData("position_hold_stiffness").getValue().toString());
+            } catch (Exception e) {
+                // Use default if not configured
+                getLogger().info("position_hold_stiffness not found in data.xml, using default: " + positionHoldStiffness);
+            }
+        
             // Load interaction thresholds
             forceThreshold = Double.parseDouble(getApplicationData().getProcessData("force_threshold").getValue().toString());
             torqueThreshold = Double.parseDouble(getApplicationData().getProcessData("torque_threshold").getValue().toString());
@@ -741,6 +760,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().info("ROS2 PC IP: " + ros2PCIP);
             getLogger().info("Stiffness: X=" + stiffnessX + ", Y=" + stiffnessY + ", Z=" + stiffnessZ + ", Rot=" + stiffnessRot);
             getLogger().info("Damping: " + damping);
+            getLogger().info("PositionHold stiffness: " + positionHoldStiffness + " Nm/rad (for gravity compensation while remaining compliant)");
         
         } catch (Exception e) {
             getLogger().error("Error loading configuration: " + e.getMessage());

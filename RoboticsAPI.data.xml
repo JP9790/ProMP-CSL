@@ -22,5 +22,6 @@
         <processData dataType="java.lang.Double" defaultValue="2.0" displayName="Torque Threshold (Nm)" editableOnHmi="true" id="torque_threshold" max="20.0" min="0.1" value="2.0"/>
         <processData dataType="java.lang.Boolean" defaultValue="true" displayName="Enable Human Interaction" editableOnHmi="true" id="enable_human_interaction" value="true"/>
         <processData dataType="java.lang.Boolean" defaultValue="true" displayName="Send Torque Data" editableOnHmi="true" id="send_torque_data" value="true"/>
+        <processData dataType="java.lang.Double" defaultValue="50.0" displayName="PositionHold Stiffness (Nm/rad)" editableOnHmi="true" id="position_hold_stiffness" max="200.0" min="10.0" value="50.0"/>
     </processDataContainer>
 </RoboticsAPIData>
