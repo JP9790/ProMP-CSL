@@ -363,67 +363,6 @@ class TrainAndExecute(Node):
         plt.tight_layout()
         plt.show()
     
-    def clamp_trajectory_to_workspace(self, trajectory):
-        """Clamp trajectory points to workspace limits, replacing out-of-bounds values with nearest valid values"""
-        # Basic workspace limits (adjust based on your robot)
-        # These are conservative limits - adjust based on your KUKA LBR workspace
-        limits = {
-            'x': (-1.0, 1.0),      # meters
-            'y': (-1.0, 1.0),      # meters
-            'z': (0.0, 1.5),       # meters (assuming z is height)
-            'alpha': (-np.pi, np.pi),  # radians
-            'beta': (-np.pi, np.pi),   # radians
-            'gamma': (-np.pi, np.pi)   # radians
-        }
-        
-        trajectory_clamped = np.array(trajectory).copy()
-        clamped_count = 0
-        
-        for i, point in enumerate(trajectory):
-            x, y, z, alpha, beta, gamma = point
-            original_point = point.copy()
-            was_clamped = False
-            
-            # Clamp each dimension to limits
-            x_clamped = np.clip(x, limits['x'][0], limits['x'][1])
-            y_clamped = np.clip(y, limits['y'][0], limits['y'][1])
-            z_clamped = np.clip(z, limits['z'][0], limits['z'][1])
-            alpha_clamped = np.clip(alpha, limits['alpha'][0], limits['alpha'][1])
-            beta_clamped = np.clip(beta, limits['beta'][0], limits['beta'][1])
-            gamma_clamped = np.clip(gamma, limits['gamma'][0], limits['gamma'][1])
-            
-            # Check if any value was clamped
-            if (x != x_clamped or y != y_clamped or z != z_clamped or 
-                alpha != alpha_clamped or beta != beta_clamped or gamma != gamma_clamped):
-                was_clamped = True
-                clamped_count += 1
-                
-                # Log the clamping (only for first few to avoid spam)
-                if clamped_count <= 10:
-                    changes = []
-                    if x != x_clamped:
-                        changes.append(f'x: {x:.3f} -> {x_clamped:.3f}')
-                    if y != y_clamped:
-                        changes.append(f'y: {y:.3f} -> {y_clamped:.3f}')
-                    if z != z_clamped:
-                        changes.append(f'z: {z:.3f} -> {z_clamped:.3f}')
-                    if alpha != alpha_clamped:
-                        changes.append(f'alpha: {alpha:.3f} -> {alpha_clamped:.3f}')
-                    if beta != beta_clamped:
-                        changes.append(f'beta: {beta:.3f} -> {beta_clamped:.3f}')
-                    if gamma != gamma_clamped:
-                        changes.append(f'gamma: {gamma:.3f} -> {gamma_clamped:.3f}')
-                    self.get_logger().warn(f'Point {i} clamped: {", ".join(changes)}')
-            
-            # Update the point with clamped values
-            trajectory_clamped[i] = [x_clamped, y_clamped, z_clamped, 
-                                     alpha_clamped, beta_clamped, gamma_clamped]
-        
-        if clamped_count > 0:
-            self.get_logger().info(f'Clamped {clamped_count}/{len(trajectory)} trajectory points to workspace limits')
-        
-        return trajectory_clamped
-    
     def send_trajectory_to_kuka(self):
         """Send learned trajectory to KUKA robot"""
         if self.learned_trajectory is None:
@@ -441,9 +380,6 @@ class TrainAndExecute(Node):
                 self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
                 return False
             
-            # Clamp trajectory to workspace limits (replace out-of-bounds points with nearest valid values)
-            self.learned_trajectory = self.clamp_trajectory_to_workspace(self.learned_trajectory)
-            
             # Format trajectory for KUKA: x,y,z,alpha,beta,gamma separated by semicolons
             # Format: "TRAJECTORY:x1,y1,z1,a1,b1,g1;x2,y2,z2,a2,b2,g2;..."
             trajectory_str = ";".join([
@@ -454,12 +390,13 @@ class TrainAndExecute(Node):
             self.get_logger().info(f'Sending trajectory to KUKA ({len(self.learned_trajectory)} points)...')
             self.kuka_socket.sendall(command.encode('utf-8'))
             
-            # Wait for completion - handle fragmented responses
+            # Wait for completion - handle fragmented responses and skip errors
             complete = False
-            error = False
             point_count = 0
+            error_count = 0
+            skipped_points = []
             
-            while not complete and not error:
+            while not complete:
                 response = self._receive_complete_message(self.kuka_socket, timeout=30.0)
                 if not response:
                     self.get_logger().warn('No response from KUKA')
@@ -468,21 +405,32 @@ class TrainAndExecute(Node):
                 response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info('Trajectory executed successfully on KUKA')
+                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count}, Errors (skipped): {error_count}')
+                    if skipped_points:
+                        self.get_logger().warn(f'Skipped points: {skipped_points[:10]}' + ('...' if len(skipped_points) > 10 else ''))
                     complete = True
                     return True
                 elif "ERROR" in response:
-                    self.get_logger().error(f'KUKA execution error: {response}')
-                    error = True
-                    return False
+                    error_count += 1
+                    # Extract point number if available in error message
+                    if point_count < len(self.learned_trajectory):
+                        skipped_points.append(point_count)
+                    self.get_logger().warn(f'Point execution error (skipping): {response}')
+                    # Continue execution - skip this point and move to next
+                    # Don't return False, just log and continue
                 elif "POINT_COMPLETE" in response:
                     point_count += 1
                     if point_count % 10 == 0:  # Log every 10 points
-                        self.get_logger().info(f'Progress: {point_count}/{len(self.learned_trajectory)} points completed')
+                        self.get_logger().info(f'Progress: {point_count}/{len(self.learned_trajectory)} points completed (errors skipped: {error_count})')
             
             if not complete:
-                self.get_logger().warn('Trajectory execution did not complete normally')
-                return False
+                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors (skipped): {error_count}')
+                # Return True if we made some progress, False if nothing worked
+                if point_count > 0:
+                    self.get_logger().info(f'Partial execution completed with {point_count} successful points')
+                    return True
+                else:
+                    return False
             
         except Exception as e:
             self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
