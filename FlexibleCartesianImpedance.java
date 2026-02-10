@@ -382,18 +382,26 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     }
                     
                 } catch (Exception e) {
-                    // Catch workspace errors and other exceptions for this specific point
+                    // Catch workspace errors, axis limit violations, and other exceptions for this specific point
                     String errorMsg = e.getMessage();
-                    getLogger().warn("Point " + i + " execution failed: " + errorMsg);
+                    String errorType = "UNKNOWN";
+                    
+                    if (errorMsg != null) {
+                        if (errorMsg.contains("Arbeitsraumfehler") || errorMsg.contains("workspace")) {
+                            errorType = "WORKSPACE_ERROR";
+                        } else if (errorMsg.contains("axis limit violation") || errorMsg.contains("software axis limit")) {
+                            errorType = "AXIS_LIMIT_VIOLATION";
+                        } else if (errorMsg.contains("can not plan motion")) {
+                            errorType = "MOTION_PLANNING_ERROR";
+                        }
+                    }
+                    
+                    getLogger().warn("Point " + i + " execution failed (" + errorType + "): " + errorMsg);
                     
                     // Send error message to Python so it can skip this point
                     synchronized (outputLock) {
                         if (out != null) {
-                            if (errorMsg != null && errorMsg.contains("Arbeitsraumfehler")) {
-                                out.println("ERROR:WORKSPACE_ERROR_POINT_" + i + ":" + errorMsg);
-                            } else {
-                                out.println("ERROR:POINT_" + i + ":" + errorMsg);
-                            }
+                            out.println("ERROR:" + errorType + "_POINT_" + i + ":" + errorMsg);
                         }
                     }
                     
