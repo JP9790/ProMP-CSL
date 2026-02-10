@@ -28,7 +28,9 @@ class StandaloneDeformationController(Node):
         self.declare_parameter('deformation_alpha', 0.1)
         self.declare_parameter('deformation_waypoints', 10)
         self.declare_parameter('promp_conditioning_sigma', 0.01)
-        self.declare_parameter('trajectory_file', 'learned_trajectory.npy')
+        # Default trajectory file location - check ~/robotexecute first (where train_and_execute.py saves it)
+        default_trajectory = os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy')
+        self.declare_parameter('trajectory_file', default_trajectory)
         self.declare_parameter('promp_file', 'promp_model.npy')
         
         # Get parameters
@@ -293,28 +295,71 @@ class StandaloneDeformationController(Node):
             String, 'load_trajectory', self.load_trajectory_callback, 10)
     
     def load_trajectory_and_promp(self):
-        """Load trajectory and ProMP from files"""
+        """Load trajectory and ProMP from files
+        Checks multiple common locations for trajectory file"""
         try:
-            # Load trajectory
-            self.current_trajectory = np.load(self.trajectory_file)
-            self.deformer.set_trajectory(self.current_trajectory)
-            self.get_logger().info(f'Loaded trajectory from {self.trajectory_file}')
+            # Try to load trajectory - check multiple locations
+            trajectory_loaded = False
+            trajectory_paths = [
+                self.trajectory_file,  # User-specified or default
+                os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy'),  # train_and_execute.py default location
+                os.path.join(os.path.expanduser('~/newfoldername'), 'learned_trajectory.npy'),  # Alternative location
+                'learned_trajectory.npy',  # Current directory
+            ]
             
-            # Load ProMP (if available)
-            try:
-                promp_data = np.load(self.promp_file, allow_pickle=True).item()
-                self.promp = ProMP()
-                self.promp.mean_weights = promp_data['mean_weights']
-                self.promp.cov_weights = promp_data['cov_weights']
-                self.promp.basis_centers = promp_data['basis_centers']
-                self.promp.basis_width = promp_data['basis_width']
-                self.get_logger().info(f'Loaded ProMP from {self.promp_file}')
-            except FileNotFoundError:
-                self.get_logger().warn(f'ProMP file not found: {self.promp_file}')
+            for traj_path in trajectory_paths:
+                if os.path.exists(traj_path):
+                    try:
+                        self.current_trajectory = np.load(traj_path)
+                        self.deformer.set_trajectory(self.current_trajectory)
+                        self.get_logger().info(f'Loaded trajectory from {traj_path}')
+                        trajectory_loaded = True
+                        break
+                    except Exception as e:
+                        self.get_logger().warn(f'Failed to load trajectory from {traj_path}: {e}')
+                        continue
+            
+            if not trajectory_loaded:
+                self.get_logger().error(f'Trajectory file not found!')
+                self.get_logger().error(f'Checked paths: {trajectory_paths}')
+                self.get_logger().error('Please run train_and_execute.py first to generate a trajectory, or specify --trajectory-file')
+                self.get_logger().error('Example: ros2 run kuka_promp_control standalone_deformation_controller --trajectory-file ~/robotexecute/learned_trajectory.npy')
+                self.current_trajectory = None
+                return
+            
+            # Load ProMP (if available) - also check multiple locations
+            promp_paths = [
+                self.promp_file,  # User-specified
+                os.path.join(os.path.expanduser('~/robotexecute'), 'promp_model.npy'),
+                'promp_model.npy',  # Current directory
+            ]
+            
+            promp_loaded = False
+            for promp_path in promp_paths:
+                if os.path.exists(promp_path):
+                    try:
+                        promp_data = np.load(promp_path, allow_pickle=True).item()
+                        self.promp = ProMP()
+                        self.promp.mean_weights = promp_data['mean_weights']
+                        self.promp.cov_weights = promp_data['cov_weights']
+                        self.promp.basis_centers = promp_data['basis_centers']
+                        self.promp.basis_width = promp_data['basis_width']
+                        self.get_logger().info(f'Loaded ProMP from {promp_path}')
+                        promp_loaded = True
+                        break
+                    except Exception as e:
+                        self.get_logger().warn(f'Failed to load ProMP from {promp_path}: {e}')
+                        continue
+            
+            if not promp_loaded:
+                self.get_logger().warn(f'ProMP file not found in any of: {promp_paths}')
+                self.get_logger().info('ProMP is optional - deformation will use trajectory deformer instead')
                 self.promp = None
                 
         except Exception as e:
             self.get_logger().error(f'Error loading trajectory/ProMP: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
     
     def start_execution_callback(self, msg):
         """Callback to start execution"""
@@ -802,7 +847,7 @@ def main(args=None):
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Standalone Deformation Controller')
     parser.add_argument('--kuka-ip', default='172.31.1.147', help='KUKA robot IP (matches train_and_execute.py)')
-    parser.add_argument('--trajectory-file', default='learned_trajectory.npy', help='Trajectory file path')
+    parser.add_argument('--trajectory-file', default=os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy'), help='Trajectory file path (default: ~/robotexecute/learned_trajectory.npy)')
     parser.add_argument('--promp-file', default='promp_model.npy', help='ProMP file path')
     parser.add_argument('--energy-threshold', type=float, default=0.5, help='Energy threshold for conditioning')
     parser.add_argument('--force-threshold', type=float, default=10.0, help='Force threshold for deformation')
