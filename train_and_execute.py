@@ -57,6 +57,12 @@ class TrainAndExecute(Node):
         self.learned_trajectory = None
         self.demos = []
         
+        # Normalization statistics for denormalizing generated trajectories
+        self.demo_min = None
+        self.demo_max = None
+        self.demo_mean = None
+        self.demo_std = None
+        
         # TCP communication
         self.kuka_socket = None
         
@@ -188,13 +194,15 @@ class TrainAndExecute(Node):
             self.demos = []
     
     def normalize_demos(self):
-        """Normalize demonstrations to same length using interpolation"""
+        """Normalize demonstrations to same length and compute statistics for denormalization"""
         if len(self.demos) == 0:
             return []
         
         target_length = self.trajectory_points
         normalized = []
+        all_values = []  # Collect all values for statistics
         
+        # First, interpolate all demos to same length
         for demo in self.demos:
             demo_array = np.array(demo)
             t_old = np.linspace(0, 1, len(demo))
@@ -203,15 +211,56 @@ class TrainAndExecute(Node):
             normalized_demo = []
             for i in range(demo_array.shape[1]):  # For each dimension
                 from scipy.interpolate import interp1d
-                interp_func = interp1d(t_old, demo_array[:, i], kind='cubic')
-                normalized_demo.append(interp_func(t_new))
+                try:
+                    interp_func = interp1d(t_old, demo_array[:, i], kind='cubic')
+                    normalized_demo.append(interp_func(t_new))
+                except ValueError:
+                    # Fallback to linear if cubic fails
+                    interp_func = interp1d(t_old, demo_array[:, i], kind='linear')
+                    normalized_demo.append(interp_func(t_new))
             
-            normalized.append(np.column_stack(normalized_demo))
+            normalized_demo_array = np.column_stack(normalized_demo)
+            normalized.append(normalized_demo_array)
+            all_values.append(normalized_demo_array)
+        
+        # Compute statistics across all demos for denormalization
+        all_values = np.concatenate(all_values, axis=0)  # Stack all demos
+        self.demo_min = np.min(all_values, axis=0)
+        self.demo_max = np.max(all_values, axis=0)
+        self.demo_mean = np.mean(all_values, axis=0)
+        self.demo_std = np.std(all_values, axis=0)
+        
+        # Avoid division by zero
+        self.demo_std = np.where(self.demo_std < 1e-10, 1.0, self.demo_std)
+        
+        self.get_logger().info(f'Demo statistics computed:')
+        self.get_logger().info(f'  Min: {self.demo_min}')
+        self.get_logger().info(f'  Max: {self.demo_max}')
+        self.get_logger().info(f'  Mean: {self.demo_mean}')
+        self.get_logger().info(f'  Std: {self.demo_std}')
+        
+        # Normalize values to [0, 1] range for ProMP training
+        normalized_scaled = []
+        for demo in normalized:
+            # Normalize: (value - min) / (max - min)
+            demo_normalized = (demo - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+            normalized_scaled.append(demo_normalized)
         
         # Debug: print shape of each normalized demo
-        for i, demo in enumerate(normalized):
-            print(f"Normalized demo {i} shape: {demo.shape}")
-        return normalized
+        for i, demo in enumerate(normalized_scaled):
+            self.get_logger().debug(f"Normalized demo {i} shape: {demo.shape}, range: [{np.min(demo):.3f}, {np.max(demo):.3f}]")
+        
+        return normalized_scaled
+    
+    def denormalize_trajectory(self, trajectory):
+        """Denormalize trajectory from [0,1] range back to original demo range"""
+        if self.demo_min is None or self.demo_max is None:
+            self.get_logger().error('Cannot denormalize: demo statistics not computed')
+            return trajectory
+        
+        # Denormalize: value * (max - min) + min
+        trajectory_denorm = trajectory * (self.demo_max - self.demo_min) + self.demo_min
+        return trajectory_denorm
     
     def train_promp(self):
         """Train ProMP on loaded demonstrations"""
@@ -235,28 +284,41 @@ class TrainAndExecute(Node):
             return False
     
     def generate_trajectory(self, num_samples=1):
-        """Generate trajectory from trained ProMP"""
+        """Generate trajectory from trained ProMP and denormalize to original scale"""
         if self.promp is None:
             self.get_logger().error('ProMP not trained yet')
             return None
         
         try:
             if num_samples == 1:
-                self.learned_trajectory = self.promp.generate_trajectory()
-                self.get_logger().info('Generated single trajectory')
+                trajectory_normalized = self.promp.generate_trajectory(num_points=self.trajectory_points)
+                self.get_logger().info(f'Generated single trajectory (normalized), shape: {trajectory_normalized.shape}')
             else:
                 # Generate multiple trajectories for visualization
                 trajectories = []
                 for _ in range(num_samples):
-                    traj = self.promp.generate_trajectory()
+                    traj = self.promp.generate_trajectory(num_points=self.trajectory_points)
                     trajectories.append(traj)
-                self.learned_trajectory = np.mean(trajectories, axis=0)
+                trajectory_normalized = np.mean(trajectories, axis=0)
                 self.get_logger().info(f'Generated {num_samples} trajectories and computed mean')
+            
+            # Denormalize trajectory back to original scale
+            self.learned_trajectory = self.denormalize_trajectory(trajectory_normalized)
+            
+            self.get_logger().info(f'Trajectory denormalized, range:')
+            self.get_logger().info(f'  X: [{np.min(self.learned_trajectory[:, 0]):.3f}, {np.max(self.learned_trajectory[:, 0]):.3f}] m')
+            self.get_logger().info(f'  Y: [{np.min(self.learned_trajectory[:, 1]):.3f}, {np.max(self.learned_trajectory[:, 1]):.3f}] m')
+            self.get_logger().info(f'  Z: [{np.min(self.learned_trajectory[:, 2]):.3f}, {np.max(self.learned_trajectory[:, 2]):.3f}] m')
+            self.get_logger().info(f'  Alpha: [{np.min(self.learned_trajectory[:, 3]):.3f}, {np.max(self.learned_trajectory[:, 3]):.3f}] rad')
+            self.get_logger().info(f'  Beta: [{np.min(self.learned_trajectory[:, 4]):.3f}, {np.max(self.learned_trajectory[:, 4]):.3f}] rad')
+            self.get_logger().info(f'  Gamma: [{np.min(self.learned_trajectory[:, 5]):.3f}, {np.max(self.learned_trajectory[:, 5]):.3f}] rad')
             
             return self.learned_trajectory
             
         except Exception as e:
             self.get_logger().error(f'Error generating trajectory: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             return None
     
     def visualize_trajectories(self):
@@ -270,15 +332,28 @@ class TrainAndExecute(Node):
         
         labels = ['X (m)', 'Y (m)', 'Z (m)', 'Alpha (rad)', 'Beta (rad)', 'Gamma (rad)']
         
-        # Plot demonstrations
+        # Plot demonstrations (original scale)
         for i in range(6):
             for j, demo in enumerate(self.demos):
                 demo_array = np.array(demo)
-                axes[i].plot(demo_array[:, i], 'b-', alpha=0.3, label='Demos' if j == 0 else "")
+                # Interpolate demo to same length for visualization
+                if len(demo_array) != self.trajectory_points:
+                    from scipy.interpolate import interp1d
+                    t_old = np.linspace(0, 1, len(demo_array))
+                    t_new = np.linspace(0, 1, self.trajectory_points)
+                    interp_func = interp1d(t_old, demo_array[:, i], kind='linear')
+                    demo_interp = interp_func(t_new)
+                else:
+                    demo_interp = demo_array[:, i]
+                axes[i].plot(demo_interp, 'b-', alpha=0.3, label='Demos' if j == 0 else "")
             
-            # Plot learned trajectory
+            # Plot learned trajectory (denormalized, original scale)
             if self.learned_trajectory is not None:
                 axes[i].plot(self.learned_trajectory[:, i], 'r-', linewidth=2, label='Learned')
+                # Show range
+                y_min = np.min(self.learned_trajectory[:, i])
+                y_max = np.max(self.learned_trajectory[:, i])
+                axes[i].set_title(f'{labels[i]} (range: [{y_min:.3f}, {y_max:.3f}])')
             
             axes[i].set_xlabel('Time Steps')
             axes[i].set_ylabel(labels[i])
@@ -287,6 +362,45 @@ class TrainAndExecute(Node):
         
         plt.tight_layout()
         plt.show()
+    
+    def validate_trajectory_workspace(self, trajectory):
+        """Validate trajectory points are within reasonable workspace limits"""
+        # Basic workspace limits (adjust based on your robot)
+        # These are conservative limits - adjust based on your KUKA LBR workspace
+        limits = {
+            'x': (-1.0, 1.0),      # meters
+            'y': (-1.0, 1.0),      # meters
+            'z': (0.0, 1.5),       # meters (assuming z is height)
+            'alpha': (-np.pi, np.pi),  # radians
+            'beta': (-np.pi, np.pi),   # radians
+            'gamma': (-np.pi, np.pi)   # radians
+        }
+        
+        invalid_points = []
+        for i, point in enumerate(trajectory):
+            x, y, z, alpha, beta, gamma = point
+            
+            # Check limits
+            if not (limits['x'][0] <= x <= limits['x'][1]):
+                invalid_points.append((i, 'x', x, limits['x']))
+            if not (limits['y'][0] <= y <= limits['y'][1]):
+                invalid_points.append((i, 'y', y, limits['y']))
+            if not (limits['z'][0] <= z <= limits['z'][1]):
+                invalid_points.append((i, 'z', z, limits['z']))
+            if not (limits['alpha'][0] <= alpha <= limits['alpha'][1]):
+                invalid_points.append((i, 'alpha', alpha, limits['alpha']))
+            if not (limits['beta'][0] <= beta <= limits['beta'][1]):
+                invalid_points.append((i, 'beta', beta, limits['beta']))
+            if not (limits['gamma'][0] <= gamma <= limits['gamma'][1]):
+                invalid_points.append((i, 'gamma', gamma, limits['gamma']))
+        
+        if invalid_points:
+            self.get_logger().warn(f'Found {len(invalid_points)} points outside workspace limits:')
+            for point_idx, dim, value, (min_val, max_val) in invalid_points[:10]:  # Show first 10
+                self.get_logger().warn(f'  Point {point_idx}, {dim}: {value:.3f} (limits: [{min_val:.3f}, {max_val:.3f}])')
+            return False
+        
+        return True
     
     def send_trajectory_to_kuka(self):
         """Send learned trajectory to KUKA robot"""
@@ -303,6 +417,12 @@ class TrainAndExecute(Node):
             traj_array = np.array(self.learned_trajectory)
             if traj_array.ndim != 2 or traj_array.shape[1] != 6:
                 self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
+                return False
+            
+            # Validate workspace limits
+            if not self.validate_trajectory_workspace(self.learned_trajectory):
+                self.get_logger().error('Trajectory contains points outside workspace limits')
+                self.get_logger().error('Please check the trajectory or adjust workspace limits')
                 return False
             
             # Format trajectory for KUKA: x,y,z,alpha,beta,gamma separated by semicolons
