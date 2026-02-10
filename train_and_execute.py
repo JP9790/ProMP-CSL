@@ -363,8 +363,8 @@ class TrainAndExecute(Node):
         plt.tight_layout()
         plt.show()
     
-    def validate_trajectory_workspace(self, trajectory):
-        """Validate trajectory points are within reasonable workspace limits"""
+    def clamp_trajectory_to_workspace(self, trajectory):
+        """Clamp trajectory points to workspace limits, replacing out-of-bounds values with nearest valid values"""
         # Basic workspace limits (adjust based on your robot)
         # These are conservative limits - adjust based on your KUKA LBR workspace
         limits = {
@@ -376,31 +376,53 @@ class TrainAndExecute(Node):
             'gamma': (-np.pi, np.pi)   # radians
         }
         
-        invalid_points = []
+        trajectory_clamped = np.array(trajectory).copy()
+        clamped_count = 0
+        
         for i, point in enumerate(trajectory):
             x, y, z, alpha, beta, gamma = point
+            original_point = point.copy()
+            was_clamped = False
             
-            # Check limits
-            if not (limits['x'][0] <= x <= limits['x'][1]):
-                invalid_points.append((i, 'x', x, limits['x']))
-            if not (limits['y'][0] <= y <= limits['y'][1]):
-                invalid_points.append((i, 'y', y, limits['y']))
-            if not (limits['z'][0] <= z <= limits['z'][1]):
-                invalid_points.append((i, 'z', z, limits['z']))
-            if not (limits['alpha'][0] <= alpha <= limits['alpha'][1]):
-                invalid_points.append((i, 'alpha', alpha, limits['alpha']))
-            if not (limits['beta'][0] <= beta <= limits['beta'][1]):
-                invalid_points.append((i, 'beta', beta, limits['beta']))
-            if not (limits['gamma'][0] <= gamma <= limits['gamma'][1]):
-                invalid_points.append((i, 'gamma', gamma, limits['gamma']))
+            # Clamp each dimension to limits
+            x_clamped = np.clip(x, limits['x'][0], limits['x'][1])
+            y_clamped = np.clip(y, limits['y'][0], limits['y'][1])
+            z_clamped = np.clip(z, limits['z'][0], limits['z'][1])
+            alpha_clamped = np.clip(alpha, limits['alpha'][0], limits['alpha'][1])
+            beta_clamped = np.clip(beta, limits['beta'][0], limits['beta'][1])
+            gamma_clamped = np.clip(gamma, limits['gamma'][0], limits['gamma'][1])
+            
+            # Check if any value was clamped
+            if (x != x_clamped or y != y_clamped or z != z_clamped or 
+                alpha != alpha_clamped or beta != beta_clamped or gamma != gamma_clamped):
+                was_clamped = True
+                clamped_count += 1
+                
+                # Log the clamping (only for first few to avoid spam)
+                if clamped_count <= 10:
+                    changes = []
+                    if x != x_clamped:
+                        changes.append(f'x: {x:.3f} -> {x_clamped:.3f}')
+                    if y != y_clamped:
+                        changes.append(f'y: {y:.3f} -> {y_clamped:.3f}')
+                    if z != z_clamped:
+                        changes.append(f'z: {z:.3f} -> {z_clamped:.3f}')
+                    if alpha != alpha_clamped:
+                        changes.append(f'alpha: {alpha:.3f} -> {alpha_clamped:.3f}')
+                    if beta != beta_clamped:
+                        changes.append(f'beta: {beta:.3f} -> {beta_clamped:.3f}')
+                    if gamma != gamma_clamped:
+                        changes.append(f'gamma: {gamma:.3f} -> {gamma_clamped:.3f}')
+                    self.get_logger().warn(f'Point {i} clamped: {", ".join(changes)}')
+            
+            # Update the point with clamped values
+            trajectory_clamped[i] = [x_clamped, y_clamped, z_clamped, 
+                                     alpha_clamped, beta_clamped, gamma_clamped]
         
-        if invalid_points:
-            self.get_logger().warn(f'Found {len(invalid_points)} points outside workspace limits:')
-            for point_idx, dim, value, (min_val, max_val) in invalid_points[:10]:  # Show first 10
-                self.get_logger().warn(f'  Point {point_idx}, {dim}: {value:.3f} (limits: [{min_val:.3f}, {max_val:.3f}])')
-            return False
+        if clamped_count > 0:
+            self.get_logger().info(f'Clamped {clamped_count}/{len(trajectory)} trajectory points to workspace limits')
         
-        return True
+        return trajectory_clamped
     
     def send_trajectory_to_kuka(self):
         """Send learned trajectory to KUKA robot"""
@@ -419,11 +441,8 @@ class TrainAndExecute(Node):
                 self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
                 return False
             
-            # Validate workspace limits
-            if not self.validate_trajectory_workspace(self.learned_trajectory):
-                self.get_logger().error('Trajectory contains points outside workspace limits')
-                self.get_logger().error('Please check the trajectory or adjust workspace limits')
-                return False
+            # Clamp trajectory to workspace limits (replace out-of-bounds points with nearest valid values)
+            self.learned_trajectory = self.clamp_trajectory_to_workspace(self.learned_trajectory)
             
             # Format trajectory for KUKA: x,y,z,alpha,beta,gamma separated by semicolons
             # Format: "TRAJECTORY:x1,y1,z1,a1,b1,g1;x2,y2,z2,a2,b2,g2;..."
