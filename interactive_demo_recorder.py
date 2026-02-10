@@ -27,10 +27,12 @@ class InteractiveDemoRecorder(Node):
         super().__init__('interactive_demo_recorder')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.170.10.25')
+        # Note: kuka_ip should match the IP where Java app is running (typically robot controller IP)
+        # ros2_pc_ip should match the IP configured in Java's RoboticsAPI.data.xml
+        self.declare_parameter('kuka_ip', '172.31.1.147')  # Default matches controller_ip from data.xml
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('torque_port', 30003)
-        self.declare_parameter('ros2_pc_ip', '192.170.10.1')
+        self.declare_parameter('ros2_pc_ip', '172.31.1.25')  # Default matches ros2_pc_ip from data.xml
         self.declare_parameter('record_frequency', 100.0)  # Hz
         self.declare_parameter('demo_duration', 10.0)  # seconds
         self.declare_parameter('num_basis_functions', 50)
