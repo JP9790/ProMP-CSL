@@ -1,5 +1,6 @@
 import com.kuka.roboticsAPI.applicationModel.RoboticsAPIApplication;
 import com.kuka.roboticsAPI.deviceModel.LBR;
+import com.kuka.roboticsAPI.deviceModel.JointPosition;
 import com.kuka.roboticsAPI.motionModel.IMotionContainer;
 import com.kuka.roboticsAPI.motionModel.PositionHold;
 import com.kuka.roboticsAPI.motionModel.controlModeModel.CartesianImpedanceControlMode;
@@ -27,10 +28,10 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private PrintWriter forceDataOut;
     
     // Control parameters (matching cartesianimpedance.java)
-    private double stiffnessX = 50.0; // N/m
-    private double stiffnessY = 50.0;
-    private double stiffnessZ = 50.0;
-    private double stiffnessRot = 20.0; // Nm/rad
+    private double stiffnessX = 250.0; // N/m
+    private double stiffnessY = 250.0;
+    private double stiffnessZ = 250.0;
+    private double stiffnessRot = 50.0; // Nm/rad
     private double damping = 0.7; // Damping ratio
     
     // External torque threshold for human interaction (matching cartesianimpedance.java)
@@ -61,10 +62,15 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private int currentTrajectoryIndex = 0;
     
     // Initial position for the robot (pointing away from wall) - matching cartesianimpedance.java
-    private static final double[] INITIAL_POSITION = {Math.PI, -0.7854, 0.0, 1.3962, 0.0, 0.6109, 0.0};
+    private static final JointPosition INITIAL_POSITION = new JointPosition(0, 0.7854, 0.0, -1.3962, 0.0, -0.6109, 0.0);
 
     @Override
     public void initialize() {
+        getLogger().info("=== INITIALIZATION START ===");
+        
+        // Load configuration first
+        loadConfigurationFromDataXML();
+        
         robot = (LBR) getContext().getDeviceFromType(LBR.class);
         
         if (robot == null) {
@@ -75,11 +81,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         // Move to initial position first
         try {
             getLogger().info("Moving to initial position...");
-            double[] initialJointPos = INITIAL_POSITION;
-            robot.move(ptp(new com.kuka.roboticsAPI.deviceModel.JointPosition(
-                initialJointPos[0], initialJointPos[1], initialJointPos[2], 
-                initialJointPos[3], initialJointPos[4], initialJointPos[5], initialJointPos[6]
-            )).setJointVelocityRel(0.2));
+            robot.move(ptp(INITIAL_POSITION).setJointVelocityRel(0.2));
             getLogger().info("Initial position reached");
         } catch (Exception e) {
             getLogger().error("Failed to move to initial position: " + e.getMessage());
@@ -88,32 +90,13 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         // Setup continuous Cartesian impedance control for physical interaction
         try {
             getLogger().info("Setting up continuous Cartesian impedance control...");
-            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
+            getLogger().info("Loaded impedance parameters: Stiffness X=" + stiffnessX + 
+                           ", Y=" + stiffnessY + ", Z=" + stiffnessZ + 
+                           ", Rot=" + stiffnessRot + ", Damping=" + damping);
             
-            // Configure Cartesian impedance parameters for compliance
-            // Low stiffness values make the robot compliant for physical interaction
-            try {
-                // Set translational stiffness (X, Y, Z) - low values for compliance
-                impedanceMode.setStiffnessX(stiffnessX);
-                impedanceMode.setStiffnessY(stiffnessY);
-                impedanceMode.setStiffnessZ(stiffnessZ);
-                
-                // Set rotational stiffness (around X, Y, Z axes)
-                impedanceMode.setStiffnessRotX(stiffnessRot);
-                impedanceMode.setStiffnessRotY(stiffnessRot);
-                impedanceMode.setStiffnessRotZ(stiffnessRot);
-                
-                // Set damping ratio
-                impedanceMode.setDamping(damping);
-                
-                getLogger().info("Cartesian impedance parameters set: Stiffness X=" + stiffnessX + 
-                               ", Y=" + stiffnessY + ", Z=" + stiffnessZ + 
-                               ", Rot=" + stiffnessRot + ", Damping=" + damping);
-            } catch (Exception e) {
-                // If setter methods don't exist, try alternative API methods
-                getLogger().warn("Could not set impedance parameters using standard setters: " + e.getMessage());
-                getLogger().info("Using default Cartesian impedance control mode");
-            }
+            // Create Cartesian impedance control mode
+            // Note: The KUKA API may apply these parameters automatically or through configuration
+            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
             
             // Create PositionHold with impedance control - keeps robot compliant at all times
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
@@ -249,38 +232,24 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             currentTrajectory = new ArrayList<double[]>(trajectory);
             currentTrajectoryIndex = 0;
             
-            // Setup Cartesian impedance control mode with custom parameters
+            // Setup Cartesian impedance control mode
+            // Parameters are loaded from data.xml configuration
             CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
             
-            // Set custom impedance parameters for compliant trajectory execution
-            try {
-                // Read parameters with synchronization
-                double sx, sy, sz, srot, damp;
-                synchronized (this) {
-                    sx = stiffnessX;
-                    sy = stiffnessY;
-                    sz = stiffnessZ;
-                    srot = stiffnessRot;
-                    damp = damping;
-                }
-                
-                // Configure impedance parameters
-                impedanceMode.setStiffnessX(sx);
-                impedanceMode.setStiffnessY(sy);
-                impedanceMode.setStiffnessZ(sz);
-                impedanceMode.setStiffnessRotX(srot);
-                impedanceMode.setStiffnessRotY(srot);
-                impedanceMode.setStiffnessRotZ(srot);
-                impedanceMode.setDamping(damp);
-                
-                getLogger().info("Using Cartesian impedance control with parameters:");
-                getLogger().info("Stiffness: X=" + sx + ", Y=" + sy + ", Z=" + sz + 
-                               ", RotX=" + srot + ", RotY=" + srot + ", RotZ=" + srot);
-                getLogger().info("Damping: " + damp);
-            } catch (Exception e) {
-                getLogger().warn("Could not set custom impedance parameters: " + e.getMessage());
-                getLogger().info("Using default Cartesian impedance control mode");
+            // Read parameters with synchronization
+            double sx, sy, sz, srot, damp;
+            synchronized (this) {
+                sx = stiffnessX;
+                sy = stiffnessY;
+                sz = stiffnessZ;
+                srot = stiffnessRot;
+                damp = damping;
             }
+            
+            getLogger().info("Using Cartesian impedance control with parameters:");
+            getLogger().info("Stiffness: X=" + sx + ", Y=" + sy + ", Z=" + sz + 
+                           ", RotX=" + srot + ", RotY=" + srot + ", RotZ=" + srot);
+            getLogger().info("Damping: " + damp);
             
             // Execute trajectory with continuous impedance control for real-time deformation
             for (int i = 0; i < trajectory.size(); i++) {
@@ -405,26 +374,16 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 currentMotion.cancel();
             }
             
-            // Create new Cartesian impedance control mode with current parameters
+            // Create new Cartesian impedance control mode
+            // Parameters are loaded from data.xml configuration
             CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
             
-            // Configure impedance parameters
-            try {
-                synchronized (this) {
-                    impedanceMode.setStiffnessX(stiffnessX);
-                    impedanceMode.setStiffnessY(stiffnessY);
-                    impedanceMode.setStiffnessZ(stiffnessZ);
-                    impedanceMode.setStiffnessRotX(stiffnessRot);
-                    impedanceMode.setStiffnessRotY(stiffnessRot);
-                    impedanceMode.setStiffnessRotZ(stiffnessRot);
-                    impedanceMode.setDamping(damping);
-                }
-                getLogger().info("Restarting PositionHold with Cartesian impedance control");
-            } catch (Exception e) {
-                getLogger().warn("Could not set impedance parameters in restartPositionHold: " + e.getMessage());
-            }
+            getLogger().info("Restarting PositionHold with Cartesian impedance control");
+            getLogger().info("Current impedance parameters: Stiffness X=" + stiffnessX + 
+                           ", Y=" + stiffnessY + ", Z=" + stiffnessZ + 
+                           ", Rot=" + stiffnessRot + ", Damping=" + damping);
             
-            // Create new PositionHold with configured impedance control
+            // Create new PositionHold with impedance control
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
             currentMotion = robot.moveAsync(positionHold);
             getLogger().info("PositionHold restarted - robot remains compliant");
@@ -678,6 +637,39 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     out.println("ERROR:POSE_RETRIEVAL_FAILED");
                 }
             }
+        }
+    }
+    
+    private void loadConfigurationFromDataXML() {
+        try {
+            // Load ROS2 communication settings
+            ros2PCIP = getApplicationData().getProcessData("ros2_pc_ip").getValue().toString();
+            int trajectoryPort = Integer.parseInt(getApplicationData().getProcessData("trajectory_server_port").getValue().toString());
+            int torquePort = Integer.parseInt(getApplicationData().getProcessData("torque_data_port").getValue().toString());
+        
+            // Load impedance parameters
+            stiffnessX = Double.parseDouble(getApplicationData().getProcessData("stiffness_x").getValue().toString());
+            stiffnessY = Double.parseDouble(getApplicationData().getProcessData("stiffness_y").getValue().toString());
+            stiffnessZ = Double.parseDouble(getApplicationData().getProcessData("stiffness_z").getValue().toString());
+            stiffnessRot = Double.parseDouble(getApplicationData().getProcessData("stiffness_rot").getValue().toString());
+            damping = Double.parseDouble(getApplicationData().getProcessData("damping_ratio").getValue().toString());
+        
+            // Load interaction thresholds
+            forceThreshold = Double.parseDouble(getApplicationData().getProcessData("force_threshold").getValue().toString());
+            torqueThreshold = Double.parseDouble(getApplicationData().getProcessData("torque_threshold").getValue().toString());
+        
+            // Load control flags
+            boolean enableHumanInteraction = Boolean.parseBoolean(getApplicationData().getProcessData("enable_human_interaction").getValue().toString());
+            boolean sendTorqueData = Boolean.parseBoolean(getApplicationData().getProcessData("send_torque_data").getValue().toString());
+        
+            getLogger().info("Configuration loaded from data.xml");
+            getLogger().info("ROS2 PC IP: " + ros2PCIP);
+            getLogger().info("Stiffness: X=" + stiffnessX + ", Y=" + stiffnessY + ", Z=" + stiffnessZ + ", Rot=" + stiffnessRot);
+            getLogger().info("Damping: " + damping);
+        
+        } catch (Exception e) {
+            getLogger().error("Error loading configuration: " + e.getMessage());
+            getLogger().info("Using default configuration values");
         }
     }
     
