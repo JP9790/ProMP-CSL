@@ -334,6 +334,21 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     // Create Frame for Cartesian motion
                     Frame targetFrame = new Frame(x, y, z, alpha, beta, gamma);
                     
+                    // Optional: Check distance from current position to detect potential workspace issues
+                    try {
+                        Frame currentFrame = robot.getCurrentCartesianPosition(robot.getFlange());
+                        double distance = Math.sqrt(
+                            Math.pow(targetFrame.getX() - currentFrame.getX(), 2) +
+                            Math.pow(targetFrame.getY() - currentFrame.getY(), 2) +
+                            Math.pow(targetFrame.getZ() - currentFrame.getZ(), 2)
+                        );
+                        if (distance > 0.5) { // Large jump might indicate workspace issue
+                            getLogger().warn("Point " + i + ": Large distance to target (" + String.format("%.3f", distance) + " m) - may cause workspace error");
+                        }
+                    } catch (Exception e) {
+                        // Ignore - just a warning check
+                    }
+                    
                     // Create CartesianImpedanceControlMode for compliant motion
                     // Note: CartesianImpedanceControlMode uses default constructor - impedance values
                     // are controlled through the robot's configuration or default behavior
@@ -348,6 +363,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     // Execute LIN motion with impedance control for compliance
                     // Robot remains compliant during motion for physical interaction
                     // With configured stiffness values, robot can be pushed/deformed during execution
+                    // Note: Workspace errors will be caught and point will be skipped
                     currentMotion = robot.moveAsync(lin(targetFrame).setMode(currentImpedanceMode));
                     
                     // Monitor execution and allow external force deformation
@@ -392,27 +408,44 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     // Catch workspace errors, axis limit violations, and other exceptions for this specific point
                     String errorMsg = e.getMessage();
                     String errorType = "UNKNOWN";
+                    String fullError = errorMsg;
                     
-                    if (errorMsg != null) {
-                        if (errorMsg.contains("Arbeitsraumfehler") || errorMsg.contains("workspace")) {
-                            errorType = "WORKSPACE_ERROR";
-                        } else if (errorMsg.contains("axis limit violation") || errorMsg.contains("software axis limit")) {
-                            errorType = "AXIS_LIMIT_VIOLATION";
-                        } else if (errorMsg.contains("can not plan motion")) {
-                            errorType = "MOTION_PLANNING_ERROR";
-                        }
+                    // Get full exception details for better debugging
+                    if (e.getCause() != null) {
+                        fullError = errorMsg + " (Cause: " + e.getCause().getMessage() + ")";
                     }
                     
-                    getLogger().warn("Point " + i + " execution failed (" + errorType + "): " + errorMsg);
+                    if (errorMsg != null) {
+                        if (errorMsg.contains("Arbeitsraumfehler") || errorMsg.contains("workspace") || 
+                            (e.getCause() != null && e.getCause().getMessage() != null && 
+                             e.getCause().getMessage().contains("Arbeitsraumfehler"))) {
+                            errorType = "WORKSPACE_ERROR";
+                            getLogger().warn("Point " + i + " is outside workspace - skipping. Position: x=" + 
+                                String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
+                        } else if (errorMsg.contains("axis limit violation") || errorMsg.contains("software axis limit")) {
+                            errorType = "AXIS_LIMIT_VIOLATION";
+                            getLogger().warn("Point " + i + " violates axis limits - skipping. Position: x=" + 
+                                String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
+                        } else if (errorMsg.contains("can not plan motion") || errorMsg.contains("cannot plan")) {
+                            errorType = "MOTION_PLANNING_ERROR";
+                            getLogger().warn("Point " + i + " cannot be planned - skipping. Position: x=" + 
+                                String.format("%.3f", x) + ", y=" + String.format("%.3f", y) + ", z=" + String.format("%.3f", z));
+                        } else {
+                            getLogger().warn("Point " + i + " execution failed: " + fullError);
+                        }
+                    } else {
+                        getLogger().warn("Point " + i + " execution failed with unknown error: " + e.getClass().getSimpleName());
+                    }
                     
                     // Send error message to Python so it can skip this point
                     synchronized (outputLock) {
                         if (out != null) {
-                            out.println("ERROR:" + errorType + "_POINT_" + i + ":" + errorMsg);
+                            out.println("ERROR:" + errorType + "_POINT_" + i + ":" + fullError);
                         }
                     }
                     
                     // Continue to next point instead of breaking
+                    // The trajectory will continue with remaining reachable points
                     continue;
                 }
             }

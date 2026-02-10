@@ -262,16 +262,28 @@ class TrainAndExecute(Node):
         # First, clip normalized trajectory to [0, 1] to prevent ProMP from generating out-of-bounds values
         trajectory_clipped = np.clip(trajectory, 0.0, 1.0)
         
-        # Check if clipping was needed
+        # Check if clipping was needed and log details
         if not np.array_equal(trajectory, trajectory_clipped):
             clipped_count = np.sum(trajectory != trajectory_clipped)
             self.get_logger().warn(f'Clipped {clipped_count} values in normalized trajectory to [0,1] range')
+            # Log which dimensions were clipped
+            for dim in range(6):
+                dim_clipped = np.sum(trajectory[:, dim] != trajectory_clipped[:, dim])
+                if dim_clipped > 0:
+                    dim_name = ['X', 'Y', 'Z', 'Alpha', 'Beta', 'Gamma'][dim]
+                    self.get_logger().warn(f'  Dimension {dim_name}: {dim_clipped} values clipped')
         
         # Denormalize: value * (max - min) + min
         trajectory_denorm = trajectory_clipped * (self.demo_max - self.demo_min) + self.demo_min
         
         # Double-check: clip denormalized trajectory to demo bounds as safety measure
+        trajectory_denorm_before = trajectory_denorm.copy()
         trajectory_denorm = np.clip(trajectory_denorm, self.demo_min, self.demo_max)
+        
+        # Check if second clipping was needed (shouldn't happen if first clipping worked)
+        if not np.array_equal(trajectory_denorm_before, trajectory_denorm):
+            second_clip_count = np.sum(trajectory_denorm_before != trajectory_denorm)
+            self.get_logger().warn(f'Additional clipping needed after denormalization: {second_clip_count} values')
         
         return trajectory_denorm
     
