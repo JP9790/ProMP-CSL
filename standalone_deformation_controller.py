@@ -10,6 +10,7 @@ import threading
 from collections import deque
 import json
 import argparse
+import os
 from .trajectory_deformer import TrajectoryDeformer
 from .promp import ProMP
 from .stepwise_em_learner import StepwiseEMLearner
@@ -19,7 +20,7 @@ class StandaloneDeformationController(Node):
         super().__init__('standalone_deformation_controller')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.170.10.25')
+        self.declare_parameter('kuka_ip', '172.31.1.147')  # Match train_and_execute.py
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('force_threshold', 10.0)
         self.declare_parameter('torque_threshold', 2.0)
@@ -50,6 +51,7 @@ class StandaloneDeformationController(Node):
         )
         self.promp = None
         self.current_trajectory = None
+        self.current_joint_trajectory = None  # Joint space trajectory
         
         # State
         self.is_executing = False
@@ -82,12 +84,18 @@ class StandaloneDeformationController(Node):
         """Setup TCP communication with KUKA robot"""
         try:
             # Connect to KUKA for sending trajectories
+            self.get_logger().info(f"Connecting to KUKA at {self.kuka_ip}:{self.kuka_port}...")
             self.kuka_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.kuka_socket.settimeout(5)  # 5 second timeout
             self.kuka_socket.connect((self.kuka_ip, self.kuka_port))
             
-            # Wait for READY signal
-            ready = self.kuka_socket.recv(1024).decode('utf-8')
-            self.get_logger().info(f'KUKA connection established: {ready}')
+            # Wait for READY signal (use robust message receiving)
+            ready = self._receive_complete_message(self.kuka_socket, timeout=5.0)
+            if ready and ready.strip() == "READY":
+                self.get_logger().info('KUKA connection established - received READY signal')
+            else:
+                self.get_logger().error(f'Unexpected response from KUKA: {ready}')
+                self.kuka_socket = None
             
             # Setup server for receiving torque data
             self.torque_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -101,6 +109,171 @@ class StandaloneDeformationController(Node):
             
         except Exception as e:
             self.get_logger().error(f'Failed to setup communication: {e}')
+            self.kuka_socket = None
+    
+    def _receive_complete_message(self, sock, timeout=5.0, buffer_size=8192):
+        """
+        Receive complete message from socket, handling multi-packet messages.
+        Assumes messages end with newline character.
+        Matches train_and_execute.py implementation.
+        """
+        try:
+            sock.settimeout(timeout)
+            message_parts = []
+            
+            while True:
+                data = sock.recv(buffer_size)
+                if not data:
+                    break
+                
+                message_parts.append(data.decode('utf-8'))
+                
+                # Check if we received a complete line (ends with newline)
+                if b'\n' in data:
+                    break
+            
+            return ''.join(message_parts)
+        except socket.timeout:
+            self.get_logger().warn(f"Timeout waiting for response (>{timeout}s)")
+            return None
+        except Exception as e:
+            self.get_logger().error(f"Error receiving message: {e}")
+            return None
+    
+    def cartesian_to_joint_python(self, cartesian_poses):
+        """Convert Cartesian poses to joint positions using pybullet IK solver
+        Matches train_and_execute.py implementation"""
+        try:
+            import pybullet as p
+            import pybullet_data
+            
+            self.get_logger().info('Using pybullet for IK computation (most reliable for KUKA)')
+            
+            # Initialize pybullet in DIRECT mode (no GUI, faster)
+            physics_client = p.connect(p.DIRECT)
+            p.setAdditionalSearchPath(pybullet_data.getDataPath())
+            
+            # Try to load KUKA LBR iiwa URDF from common locations
+            robot_id = None
+            urdf_paths = [
+                "kuka_iiwa/model.urdf",  # pybullet_data
+                "kuka_lbr_iiwa_14_r820.urdf",  # Common name
+                "/opt/ros/noetic/share/kuka_description/urdf/kuka_lbr_iiwa_14_r820.urdf",  # ROS path
+            ]
+            
+            for urdf_path in urdf_paths:
+                try:
+                    robot_id = p.loadURDF(urdf_path, [0, 0, 0], useFixedBase=True)
+                    self.get_logger().info(f'Loaded KUKA URDF from: {urdf_path}')
+                    break
+                except:
+                    continue
+            
+            # If URDF not found, create a simple 7-DOF model
+            if robot_id is None:
+                self.get_logger().warn('KUKA URDF not found, creating simplified 7-DOF model')
+                robot_id = self._create_simple_kuka_model(p)
+            
+            if robot_id is None:
+                self.get_logger().error('Failed to create robot model')
+                p.disconnect()
+                return None
+            
+            # Get number of joints
+            num_joints = p.getNumJoints(robot_id)
+            end_effector_link = num_joints - 1
+            
+            joint_positions = []
+            failed_count = 0
+            
+            # Initial joint configuration (seed for IK)
+            initial_joints = [0.0, 0.7854, 0.0, -1.3962, 0.0, -0.6109, 0.0]
+            current_joints = initial_joints.copy()
+            
+            self.get_logger().info(f'Computing IK for {len(cartesian_poses)} poses using pybullet...')
+            
+            for i, pose in enumerate(cartesian_poses):
+                x, y, z, alpha, beta, gamma = pose
+                target_pos = [x, y, z]
+                target_orn = p.getQuaternionFromEuler([alpha, beta, gamma])
+                
+                try:
+                    # Compute IK using pybullet's built-in solver
+                    joint_angles = p.calculateInverseKinematics(
+                        robot_id,
+                        end_effector_link,
+                        target_pos,
+                        target_orn,
+                        lowerLimits=[-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054],
+                        upperLimits=[2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054],
+                        jointRanges=[5.934, 4.188, 5.934, 4.188, 5.934, 4.188, 6.108],
+                        restPoses=current_joints,
+                        maxNumIterations=200,
+                        residualThreshold=1e-5
+                    )
+                    
+                    if joint_angles is not None and len(joint_angles) >= 7:
+                        joint_angles_7 = list(joint_angles[:7])
+                        
+                        # Verify joint limits
+                        valid = True
+                        limits = [(-2.967, 2.967), (-2.094, 2.094), (-2.967, 2.967),
+                                 (-2.094, 2.094), (-2.967, 2.967), (-2.094, 2.094),
+                                 (-3.054, 3.054)]
+                        for j, (angle, (min_val, max_val)) in enumerate(zip(joint_angles_7, limits)):
+                            if angle < min_val or angle > max_val:
+                                valid = False
+                                break
+                        
+                        if valid:
+                            joint_positions.append(joint_angles_7)
+                            current_joints = joint_angles_7.copy()
+                        else:
+                            if len(joint_positions) > 0:
+                                joint_positions.append(joint_positions[-1])
+                            else:
+                                joint_positions.append(initial_joints)
+                            failed_count += 1
+                    else:
+                        raise ValueError("IK returned invalid result")
+                        
+                except Exception as e:
+                    self.get_logger().warn(f'Pybullet IK failed for point {i}: {e}')
+                    failed_count += 1
+                    if len(joint_positions) > 0:
+                        joint_positions.append(joint_positions[-1])
+                    else:
+                        joint_positions.append(initial_joints)
+                
+                if (i + 1) % 10 == 0:
+                    self.get_logger().info(f'Pybullet IK progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
+            
+            p.disconnect()
+            
+            if failed_count == 0:
+                self.get_logger().info(f'Successfully computed IK for all {len(cartesian_poses)} poses using pybullet')
+            else:
+                self.get_logger().warn(f'IK computed with {failed_count} failures (used previous/initial positions)')
+            
+            return np.array(joint_positions)
+            
+        except ImportError:
+            self.get_logger().error('pybullet not installed. Install with: pip install pybullet')
+            return None
+        except Exception as e:
+            self.get_logger().error(f'pybullet IK failed: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return None
+    
+    def _create_simple_kuka_model(self, p):
+        """Create a simple 7-DOF KUKA LBR iiwa model for IK"""
+        # This is a simplified model - for best results, use actual URDF
+        base_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.1, 0.1, 0.05])
+        base_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.1, 0.1, 0.05])
+        base_body = p.createMultiBody(baseMass=0, baseVisualShapeIndex=base_visual, baseCollisionShapeIndex=base_collision)
+        self.get_logger().warn('Simplified model created - accuracy may be reduced. Use actual URDF for best results.')
+        return base_body
     
     def setup_ros_communication(self):
         """Setup ROS2 publishers and subscribers"""
@@ -229,43 +402,117 @@ class StandaloneDeformationController(Node):
         trajectory = np.copy(self.current_trajectory)
         num_points = trajectory.shape[0]
         dt = 0.01  # 100 Hz
-        # Send the full trajectory at the start
-        self.send_trajectory_to_kuka(trajectory)
+        
+        # Send the full trajectory at the start (non-blocking)
+        self.send_trajectory_to_kuka_async(trajectory)
         self.get_logger().info('Started monitoring for deformation during execution')
+        
+        # Track current execution state
+        trajectory_executing = True
+        last_deformation_time = 0
+        deformation_cooldown = 0.5  # Minimum time between deformations (seconds)
+        
         while self.is_executing:
             # Check for external torque/force
             if len(self.torque_data) > 0:
                 latest = self.torque_data[-1]
                 max_force = max(abs(f) for f in latest['force'])
                 max_torque = max(abs(t) for t in latest['torque'])
-                if max_force > self.force_threshold or max_torque > self.torque_threshold:
-                    # Compute deformation energy (example: norm of force+torque)
+                
+                # Check if force/torque exceeds threshold and cooldown has passed
+                current_time = time.time()
+                if (max_force > self.force_threshold or max_torque > self.torque_threshold) and \
+                   (current_time - last_deformation_time) > deformation_cooldown:
+                    
+                    # Compute deformation energy
                     energy = np.linalg.norm(latest['force']) + np.linalg.norm(latest['torque'])
-                    self.get_logger().info(f'Deformation detected! Energy: {energy:.4f}')
-                    # Send STOP to robot
-                    self.kuka_socket.sendall(b"STOP\n")
-                    self.get_logger().info('Sent STOP to robot, waiting for STOPPED...')
-                    while True:
-                        response = self.kuka_socket.recv(1024).decode('utf-8')
-                        self.get_logger().info(f'KUKA response: {response}')
-                        if "STOPPED" in response:
-                            break
-                    # Generate new trajectory
-                    if energy < self.energy_threshold:
-                        self.get_logger().info('Triggering ProMP conditioning (low energy)')
-                        t_condition = 0.5  # Example: mid-trajectory, or use actual index
+                    self.get_logger().info(f'Deformation detected! Energy: {energy:.4f}, Force: {max_force:.2f}N, Torque: {max_torque:.2f}Nm')
+                    
+                    # Send STOP to robot (non-blocking with timeout)
+                    try:
+                        self.kuka_socket.sendall(b"STOP\n")
+                        self.get_logger().info('Sent STOP to robot')
+                        
+                        # Wait for STOPPED response with timeout
+                        self.kuka_socket.settimeout(2.0)  # 2 second timeout
+                        try:
+                            response = self.kuka_socket.recv(1024).decode('utf-8')
+                            self.get_logger().info(f'KUKA response: {response}')
+                            if "STOPPED" not in response:
+                                self.get_logger().warn('Did not receive STOPPED confirmation, proceeding anyway')
+                        except socket.timeout:
+                            self.get_logger().warn('Timeout waiting for STOPPED, proceeding with new trajectory')
+                        finally:
+                            self.kuka_socket.settimeout(None)  # Reset timeout
+                    except Exception as e:
+                        self.get_logger().error(f'Error sending STOP: {e}')
+                    
+                    # Get current robot position for conditioning (if available)
+                    # For now, use mid-trajectory point as condition
+                    try:
+                        # Try to get current pose from robot
+                        self.kuka_socket.sendall(b"GET_POSE\n")
+                        self.kuka_socket.settimeout(1.0)
+                        pose_response = self.kuka_socket.recv(1024).decode('utf-8')
+                        self.kuka_socket.settimeout(None)
+                        
+                        if pose_response.startswith("POSE:"):
+                            # Parse current pose
+                            pose_str = pose_response.split("POSE:")[1].strip()
+                            current_pose = np.array([float(x) for x in pose_str.split(",")])
+                            t_condition = 0.5  # Use current time in trajectory (normalized)
+                            y_condition = current_pose
+                        else:
+                            # Fallback: use mid-trajectory point
+                            t_condition = 0.5
+                            y_condition = trajectory[int(num_points * t_condition)]
+                    except Exception as e:
+                        self.get_logger().warn(f'Could not get current pose: {e}, using mid-trajectory point')
+                        t_condition = 0.5
                         y_condition = trajectory[int(num_points * t_condition)]
-                        self.promp.condition_on_waypoint(t_condition, y_condition)
-                        new_traj = self.promp.generate_trajectory(num_points=num_points)
-                    else:
-                        self.get_logger().info('Triggering stepwise EM update (high energy)')
-                        em_learner = StepwiseEMLearner(self.promp)
-                        new_traj = em_learner.update_and_generate(trajectory, latest)
-                    # Send new trajectory
-                    self.send_trajectory_to_kuka(new_traj)
-                    self.get_logger().info('Sent new trajectory to robot after deformation')
-                    trajectory = new_traj
+                    
+                    # Generate new trajectory based on deformation energy
+                    try:
+                        if self.promp is not None:
+                            if energy < self.energy_threshold:
+                                self.get_logger().info('Triggering ProMP conditioning (low energy)')
+                                self.promp.condition_on_waypoint(t_condition, y_condition)
+                                new_traj = self.promp.generate_trajectory(num_points=num_points)
+                            else:
+                                self.get_logger().info('Triggering stepwise EM update (high energy)')
+                                em_learner = StepwiseEMLearner(self.promp)
+                                new_traj = em_learner.update_and_generate(trajectory, latest)
+                        else:
+                            # No ProMP available - use trajectory deformer
+                            self.get_logger().info('Using trajectory deformer (no ProMP available)')
+                            human_input = np.array(latest['force'] + latest['torque'])
+                            deformed_traj, _, _ = self.deformer.deform(human_input)
+                            if deformed_traj is not None:
+                                new_traj = deformed_traj
+                            else:
+                                self.get_logger().warn('Deformation failed, keeping current trajectory')
+                                new_traj = trajectory
+                        
+                        # Update trajectory and send to robot
+                        trajectory = new_traj
+                        self.current_trajectory = new_traj
+                        self.deformer.set_trajectory(new_traj)
+                        
+                        # Send new trajectory (non-blocking)
+                        self.send_trajectory_to_kuka_async(new_traj)
+                        self.get_logger().info('Sent new trajectory to robot after deformation')
+                        
+                        last_deformation_time = current_time
+                        self.deformation_count += 1
+                        self.total_energy += energy
+                        
+                    except Exception as e:
+                        self.get_logger().error(f'Error generating new trajectory: {e}')
+                        import traceback
+                        self.get_logger().error(traceback.format_exc())
+            
             time.sleep(dt)
+        
         self.is_executing = False
         self.get_logger().info('Trajectory execution finished')
     
@@ -375,25 +622,146 @@ class StandaloneDeformationController(Node):
         self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
     
     def send_trajectory_to_kuka(self, trajectory):
-        """Send full trajectory to KUKA robot and wait for completion"""
-        trajectory_str = ";".join([",".join(map(str, point)) for point in trajectory])
-        command = f"TRAJECTORY:{trajectory_str}"
+        """Send full trajectory to KUKA robot and wait for completion (blocking)
+        Converts Cartesian to joint positions using pybullet IK to avoid workspace errors
+        Matches train_and_execute.py implementation"""
+        if self.kuka_socket is None:
+            self.get_logger().error('No connection to KUKA robot')
+            return False
+        
         try:
-            self.kuka_socket.sendall((command + "\n").encode('utf-8'))
-            self.get_logger().info('Sent full trajectory to KUKA')
-            while True:
-                response = self.kuka_socket.recv(1024).decode('utf-8')
-                self.get_logger().info(f'KUKA response: {response}')
+            # Validate trajectory format
+            traj_array = np.array(trajectory)
+            if traj_array.ndim != 2 or traj_array.shape[1] != 6:
+                self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
+                return False
+            
+            # Convert Cartesian to joint positions using pybullet IK (matches train_and_execute.py)
+            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
+            joint_trajectory = self.cartesian_to_joint_python(trajectory)
+            
+            if joint_trajectory is None or len(joint_trajectory) == 0:
+                self.get_logger().error('Failed to convert trajectory to joint positions')
+                self.get_logger().error('Please install pybullet: pip install pybullet')
+                return False
+            
+            # Store joint trajectory
+            self.current_joint_trajectory = joint_trajectory
+            
+            # Format joint trajectory for KUKA: j1,j2,j3,j4,j5,j6,j7 separated by semicolons
+            trajectory_str = ";".join([
+                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
+            ])
+            
+            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
+            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
+            self.get_logger().info('Using joint positions avoids workspace errors - all points should be reachable')
+            self.kuka_socket.sendall(command.encode('utf-8'))
+            
+            # Wait for completion using robust message receiving
+            complete = False
+            point_count = 0
+            error_count = 0
+            
+            while not complete:
+                response = self._receive_complete_message(self.kuka_socket, timeout=30.0)
+                if not response:
+                    self.get_logger().warn('No response from KUKA')
+                    break
+                
+                response = response.strip()
+                
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info('Trajectory executed successfully on KUKA')
-                    break
+                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count}, Errors (skipped): {error_count}')
+                    complete = True
+                    return True
                 elif "ERROR" in response:
-                    self.get_logger().error(f'KUKA execution error: {response}')
-                    break
+                    error_count += 1
+                    self.get_logger().warn(f'Point execution error (skipping): {response}')
                 elif "POINT_COMPLETE" in response:
-                    continue
+                    point_count += 1
+                    if point_count % 10 == 0:
+                        self.get_logger().info(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
+            
+            if not complete:
+                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors: {error_count}')
+                return point_count > 0  # Return True if some progress made
+            
         except Exception as e:
             self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return False
+    
+    def send_trajectory_to_kuka_async(self, trajectory):
+        """Send trajectory to KUKA robot without blocking (for real-time updates)
+        Converts Cartesian to joint positions using pybullet IK"""
+        def send_and_monitor():
+            if self.kuka_socket is None:
+                self.get_logger().error('No connection to KUKA robot')
+                return
+            
+            try:
+                # Validate trajectory format
+                traj_array = np.array(trajectory)
+                if traj_array.ndim != 2 or traj_array.shape[1] != 6:
+                    self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
+                    return
+                
+                # Convert Cartesian to joint positions using pybullet IK
+                self.get_logger().info('Converting Cartesian trajectory to joint positions (async)...')
+                joint_trajectory = self.cartesian_to_joint_python(trajectory)
+                
+                if joint_trajectory is None or len(joint_trajectory) == 0:
+                    self.get_logger().error('Failed to convert trajectory to joint positions')
+                    return
+                
+                # Store joint trajectory
+                self.current_joint_trajectory = joint_trajectory
+                
+                # Format joint trajectory for KUKA
+                trajectory_str = ";".join([
+                    ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
+                ])
+                
+                command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
+                self.kuka_socket.sendall(command.encode('utf-8'))
+                self.get_logger().info(f'Sent joint trajectory to KUKA ({len(joint_trajectory)} points) - monitoring in background')
+                
+                # Monitor responses in background (non-blocking for main loop)
+                error_count = 0
+                point_count = 0
+                while True:
+                    try:
+                        response = self._receive_complete_message(self.kuka_socket, timeout=0.1)
+                        if not response:
+                            continue  # Timeout is expected - continue monitoring
+                        
+                        response = response.strip()
+                        
+                        if "TRAJECTORY_COMPLETE" in response:
+                            self.get_logger().info(f'Trajectory completed: {point_count} points, {error_count} errors')
+                            break
+                        elif "ERROR" in response:
+                            error_count += 1
+                            self.get_logger().warn(f'Trajectory execution error: {response}')
+                        elif "POINT_COMPLETE" in response:
+                            point_count += 1
+                    except socket.timeout:
+                        # Timeout is expected - continue monitoring
+                        continue
+                    except Exception as e:
+                        self.get_logger().error(f'Error monitoring trajectory: {e}')
+                        break
+            except Exception as e:
+                self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
+                import traceback
+                self.get_logger().error(traceback.format_exc())
+        
+        # Start trajectory sending in separate thread
+        thread = threading.Thread(target=send_and_monitor)
+        thread.daemon = True
+        thread.start()
     
     def publish_statistics(self):
         """Publish execution statistics"""
@@ -433,7 +801,7 @@ def main(args=None):
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Standalone Deformation Controller')
-    parser.add_argument('--kuka-ip', default='192.170.10.25', help='KUKA robot IP')
+    parser.add_argument('--kuka-ip', default='172.31.1.147', help='KUKA robot IP (matches train_and_execute.py)')
     parser.add_argument('--trajectory-file', default='learned_trajectory.npy', help='Trajectory file path')
     parser.add_argument('--promp-file', default='promp_model.npy', help='ProMP file path')
     parser.add_argument('--energy-threshold', type=float, default=0.5, help='Energy threshold for conditioning')
