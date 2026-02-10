@@ -614,27 +614,19 @@ class TrainAndExecute(Node):
                 self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
                 return False
             
-            # Convert Cartesian to joint positions using Python IK solver
-            # This prevents workspace errors by computing valid joint positions before sending
-            self.get_logger().info('Converting Cartesian trajectory to joint positions using Python IK...')
-            joint_trajectory = self.cartesian_to_joint_via_java(self.learned_trajectory)
+            # Send Cartesian trajectory directly - Java's motion planner handles IK internally
+            # The existing error handling in Java will skip unreachable points and continue execution
+            self.get_logger().info('Sending Cartesian trajectory - Java will handle IK during execution')
+            self.get_logger().info('Note: Some points may be unreachable, but execution will continue with reachable points')
             
-            if joint_trajectory is None or len(joint_trajectory) == 0:
-                self.get_logger().error('Failed to convert trajectory to joint positions - cannot proceed')
-                return False
-            
-            # Store joint trajectory
-            self.learned_joint_trajectory = joint_trajectory
-            
-            # Format joint trajectory for KUKA: j1,j2,j3,j4,j5,j6,j7 separated by semicolons
-            # Format: "JOINT_TRAJECTORY:j1_1,j2_1,j3_1,j4_1,j5_1,j6_1,j7_1;j1_2,j2_2,..."
+            # Format Cartesian trajectory for KUKA: x,y,z,alpha,beta,gamma separated by semicolons
+            # Format: "TRAJECTORY:x1,y1,z1,a1,b1,g1;x2,y2,z2,a2,b2,g2;..."
             trajectory_str = ";".join([
-                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
+                ",".join([f"{val:.6f}" for val in point]) for point in self.learned_trajectory
             ])
             
-            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
-            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
-            self.get_logger().info('Using joint positions avoids workspace errors - all points should be reachable')
+            command = f"TRAJECTORY:{trajectory_str}\n"
+            self.get_logger().info(f'Sending Cartesian trajectory to KUKA ({len(self.learned_trajectory)} points)...')
             self.kuka_socket.sendall(command.encode('utf-8'))
             
             # Wait for completion - handle fragmented responses and skip errors
