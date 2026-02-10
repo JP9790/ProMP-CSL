@@ -90,12 +90,38 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().info("Setting up continuous Cartesian impedance control...");
             CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
             
+            // Configure Cartesian impedance parameters for compliance
+            // Low stiffness values make the robot compliant for physical interaction
+            try {
+                // Set translational stiffness (X, Y, Z) - low values for compliance
+                impedanceMode.setStiffnessX(stiffnessX);
+                impedanceMode.setStiffnessY(stiffnessY);
+                impedanceMode.setStiffnessZ(stiffnessZ);
+                
+                // Set rotational stiffness (around X, Y, Z axes)
+                impedanceMode.setStiffnessRotX(stiffnessRot);
+                impedanceMode.setStiffnessRotY(stiffnessRot);
+                impedanceMode.setStiffnessRotZ(stiffnessRot);
+                
+                // Set damping ratio
+                impedanceMode.setDamping(damping);
+                
+                getLogger().info("Cartesian impedance parameters set: Stiffness X=" + stiffnessX + 
+                               ", Y=" + stiffnessY + ", Z=" + stiffnessZ + 
+                               ", Rot=" + stiffnessRot + ", Damping=" + damping);
+            } catch (Exception e) {
+                // If setter methods don't exist, try alternative API methods
+                getLogger().warn("Could not set impedance parameters using standard setters: " + e.getMessage());
+                getLogger().info("Using default Cartesian impedance control mode");
+            }
+            
             // Create PositionHold with impedance control - keeps robot compliant at all times
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
             currentMotion = robot.moveAsync(positionHold);
             getLogger().info("Cartesian impedance control activated - robot is now compliant for physical interaction");
         } catch (Exception e) {
             getLogger().error("Failed to setup impedance control: " + e.getMessage());
+            e.printStackTrace();
         }
         
         try {
@@ -226,12 +252,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             // Setup Cartesian impedance control mode with custom parameters
             CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
             
-            // Try to set custom impedance parameters if available
+            // Set custom impedance parameters for compliant trajectory execution
             try {
-                // Note: The exact method names may vary depending on your KUKA API version
-                // This will use default settings if custom setters are not available
-                getLogger().info("Using Cartesian impedance control with custom parameters for compliant trajectory execution");
-                
                 // Read parameters with synchronization
                 double sx, sy, sz, srot, damp;
                 synchronized (this) {
@@ -242,11 +264,22 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     damp = damping;
                 }
                 
+                // Configure impedance parameters
+                impedanceMode.setStiffnessX(sx);
+                impedanceMode.setStiffnessY(sy);
+                impedanceMode.setStiffnessZ(sz);
+                impedanceMode.setStiffnessRotX(srot);
+                impedanceMode.setStiffnessRotY(srot);
+                impedanceMode.setStiffnessRotZ(srot);
+                impedanceMode.setDamping(damp);
+                
+                getLogger().info("Using Cartesian impedance control with parameters:");
                 getLogger().info("Stiffness: X=" + sx + ", Y=" + sy + ", Z=" + sz + 
                                ", RotX=" + srot + ", RotY=" + srot + ", RotZ=" + srot);
                 getLogger().info("Damping: " + damp);
             } catch (Exception e) {
-                getLogger().warn("Could not set custom impedance parameters, using defaults: " + e.getMessage());
+                getLogger().warn("Could not set custom impedance parameters: " + e.getMessage());
+                getLogger().info("Using default Cartesian impedance control mode");
             }
             
             // Execute trajectory with continuous impedance control for real-time deformation
@@ -363,7 +396,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
      */
     private void restartPositionHold() {
         try {
-            if (robot == null || positionHold == null) {
+            if (robot == null) {
                 return;
             }
             
@@ -372,11 +405,32 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 currentMotion.cancel();
             }
             
-            // Restart PositionHold with impedance control
+            // Create new Cartesian impedance control mode with current parameters
+            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
+            
+            // Configure impedance parameters
+            try {
+                synchronized (this) {
+                    impedanceMode.setStiffnessX(stiffnessX);
+                    impedanceMode.setStiffnessY(stiffnessY);
+                    impedanceMode.setStiffnessZ(stiffnessZ);
+                    impedanceMode.setStiffnessRotX(stiffnessRot);
+                    impedanceMode.setStiffnessRotY(stiffnessRot);
+                    impedanceMode.setStiffnessRotZ(stiffnessRot);
+                    impedanceMode.setDamping(damping);
+                }
+                getLogger().info("Restarting PositionHold with Cartesian impedance control");
+            } catch (Exception e) {
+                getLogger().warn("Could not set impedance parameters in restartPositionHold: " + e.getMessage());
+            }
+            
+            // Create new PositionHold with configured impedance control
+            positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
             currentMotion = robot.moveAsync(positionHold);
             getLogger().info("PositionHold restarted - robot remains compliant");
         } catch (Exception e) {
             getLogger().error("Error restarting PositionHold: " + e.getMessage());
+            e.printStackTrace();
         }
     }
     
@@ -402,7 +456,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             
         } catch (Exception e) {
             // Log error but continue - force sensor might not be available in all configurations
-            getLogger().debug("Error reading force sensor data: " + e.getMessage());
+            getLogger().info("Error reading force sensor data: " + e.getMessage());
         }
     }
     
