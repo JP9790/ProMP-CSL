@@ -193,14 +193,17 @@ class InteractiveDemoRecorder(Node):
         if self.kuka_connected:
             try:
                 self.kuka_socket.sendall(b'START_DEMO_RECORDING\n')
-                response = self.kuka_socket.recv(1024).decode('utf-8').strip()
-                if response == "DEMO_RECORDING_STARTED":
+                # Read response - may need multiple recv calls for complete message
+                response = self._receive_complete_message(self.kuka_socket, timeout=5.0)
+                if response and response.strip() == "DEMO_RECORDING_STARTED":
                     self.get_logger().info("Demo recording started on Java app")
                 else:
                     self.get_logger().error(f"Failed to start demo recording: {response}")
+                    self.is_recording = False
                     return
             except Exception as e:
-                self.get_logger().error(f"Error starting demo recording: {e}')
+                self.get_logger().error(f"Error starting demo recording: {e}")
+                self.is_recording = False
                 return
         
         while self.is_recording and (time.time() - start_time) < self.demo_duration:
@@ -217,8 +220,8 @@ class InteractiveDemoRecorder(Node):
         if self.kuka_connected:
             try:
                 self.kuka_socket.sendall(b'STOP_DEMO_RECORDING\n')
-                response = self.kuka_socket.recv(1024).decode('utf-8').strip()
-                if response == "DEMO_RECORDING_STOPPED":
+                response = self._receive_complete_message(self.kuka_socket, timeout=5.0)
+                if response and response.strip() == "DEMO_RECORDING_STOPPED":
                     self.get_logger().info("Demo recording stopped on Java app")
                 else:
                     self.get_logger().error(f"Failed to stop demo recording: {response}")
@@ -234,7 +237,13 @@ class InteractiveDemoRecorder(Node):
         try:
             # Request all demos from Java app
             self.kuka_socket.sendall(b'GET_DEMOS\n')
-            response = self.kuka_socket.recv(8192).decode('utf-8').strip()  # Larger buffer for demos
+            # Use larger buffer and receive complete message (demos can be large)
+            response = self._receive_complete_message(self.kuka_socket, timeout=10.0, buffer_size=65536)
+            if not response:
+                self.get_logger().error("No response received from Java app")
+                return False
+            
+            response = response.strip()
             
             if response.startswith('DEMOS:'):
                 # Parse the demos from Java app
@@ -246,14 +255,24 @@ class InteractiveDemoRecorder(Node):
                 for section in demo_sections:
                     if section.strip() and section.startswith('DEMO_'):
                         # Parse individual demo
-                        demo_lines = section.split(';')
+                        # Remove "DEMO_X:" prefix first
+                        colon_idx = section.find(':')
+                        if colon_idx == -1:
+                            continue
+                        poses_str = section[colon_idx + 1:]  # Get everything after "DEMO_X:"
+                        
+                        demo_lines = poses_str.split(';')
                         demo_data = []
                         
                         for line in demo_lines:
                             if line.strip() and ',' in line:
-                                pose_values = [float(x) for x in line.split(',')]
-                                if len(pose_values) >= 6:
-                                    demo_data.append(pose_values[:6])  # x, y, z, alpha, beta, gamma
+                                try:
+                                    pose_values = [float(x) for x in line.split(',')]
+                                    if len(pose_values) >= 6:
+                                        demo_data.append(pose_values[:6])  # x, y, z, alpha, beta, gamma
+                                except ValueError:
+                                    # Skip invalid pose data
+                                    continue
                         
                         if demo_data:
                             self.demos.append(demo_data)
@@ -376,6 +395,34 @@ class InteractiveDemoRecorder(Node):
     # def normalize_demos(self): ...
     # etc.
 
+    def _receive_complete_message(self, sock, timeout=5.0, buffer_size=8192):
+        """
+        Receive complete message from socket, handling multi-packet messages.
+        Assumes messages end with newline character.
+        """
+        try:
+            sock.settimeout(timeout)
+            message_parts = []
+            
+            while True:
+                data = sock.recv(buffer_size)
+                if not data:
+                    break
+                
+                message_parts.append(data.decode('utf-8'))
+                
+                # Check if we received a complete line (ends with newline)
+                if b'\n' in data:
+                    break
+            
+            return ''.join(message_parts)
+        except socket.timeout:
+            self.get_logger().warn(f"Timeout waiting for response (>{timeout}s)")
+            return None
+        except Exception as e:
+            self.get_logger().error(f"Error receiving message: {e}")
+            return None
+    
     def timer_callback(self):
         """Periodic timer callback"""
         # Publish status

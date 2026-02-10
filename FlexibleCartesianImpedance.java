@@ -6,11 +6,13 @@ import com.kuka.roboticsAPI.motionModel.controlModeModel.CartesianImpedanceContr
 import com.kuka.roboticsAPI.geometricModel.Frame;
 import com.kuka.roboticsAPI.motionModel.PTP;
 import com.kuka.roboticsAPI.motionModel.LIN;
+import com.kuka.roboticsAPI.sensorModel.ForceSensorData;
 import static com.kuka.roboticsAPI.motionModel.BasicMotions.*;
 
 import java.io.*;
 import java.net.*;
 import java.util.*;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
@@ -36,16 +38,21 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private double torqueThreshold = 2.0; // Nm
     
     // ROS2 PC IP address - Same network as KUKA (matching cartesianimpedance.java)
-    private String ros2PCIP = "172.31.1.100"; // ROS2 PC IP (same network)
+    private String ros2PCIP = "172.31.1.25"; // ROS2 PC IP (same network)
     
     private IMotionContainer currentMotion = null;
+    private PositionHold positionHold = null;  // For continuous impedance control
     private AtomicBoolean isRunning = new AtomicBoolean(false);
     private AtomicBoolean stopRequested = new AtomicBoolean(false);
+    private AtomicBoolean forceDataThreadRunning = new AtomicBoolean(false);
+    
+    // Lock object for thread-safe PrintWriter access
+    private final Object outputLock = new Object();
     
     // Demo recording variables
     private List<double[]> currentDemo = new ArrayList<double[]>();
     private List<List<double[]>> allDemos = new ArrayList<List<double[]>>();
-    private boolean isRecordingDemo = false;
+    private AtomicBoolean isRecordingDemo = new AtomicBoolean(false);  // Thread-safe
     private long demoStartTime;
     
     // Deformation variables
@@ -60,6 +67,11 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     public void initialize() {
         robot = (LBR) getContext().getDeviceFromType(LBR.class);
         
+        if (robot == null) {
+            getLogger().error("Failed to get robot device - robot is NULL!");
+            return;
+        }
+        
         // Move to initial position first
         try {
             getLogger().info("Moving to initial position...");
@@ -73,6 +85,19 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().error("Failed to move to initial position: " + e.getMessage());
         }
         
+        // Setup continuous Cartesian impedance control for physical interaction
+        try {
+            getLogger().info("Setting up continuous Cartesian impedance control...");
+            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
+            
+            // Create PositionHold with impedance control - keeps robot compliant at all times
+            positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
+            currentMotion = robot.moveAsync(positionHold);
+            getLogger().info("Cartesian impedance control activated - robot is now compliant for physical interaction");
+        } catch (Exception e) {
+            getLogger().error("Failed to setup impedance control: " + e.getMessage());
+        }
+        
         try {
             serverSocket = new ServerSocket(30002);
             getLogger().info("All-in-one server started on port 30002");
@@ -82,6 +107,18 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 forceDataSocket = new Socket(ros2PCIP, 30003); // Python controller IP and port
                 forceDataOut = new PrintWriter(forceDataSocket.getOutputStream(), true);
                 getLogger().info("Force data connection established to Python controller");
+                
+                // Start continuous force data sending thread
+                forceDataThreadRunning.set(true);
+                Thread forceDataThread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        continuousForceDataSender();
+                    }
+                });
+                forceDataThread.setDaemon(true);
+                forceDataThread.start();
+                getLogger().info("Force data sending thread started");
             } catch (IOException e) {
                 getLogger().warn("Could not connect to Python controller for force data: " + e.getMessage());
                 getLogger().info("Force data will be logged locally only");
@@ -114,10 +151,22 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 } else if (line.startsWith("CLEAR_DEMOS")) {
                     clearDemos();
                 } else if (line.startsWith("TRAJECTORY:")) {
-                    executeTrajectory(line.substring("TRAJECTORY:".length()));
+                    // Execute trajectory in separate thread to allow command processing during execution
+                    final String trajData = line.substring("TRAJECTORY:".length());
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            executeTrajectory(trajData);
+                        }
+                    }).start();
                 } else if (line.equals("STOP")) {
+                    stopRequested.set(true);  // Set flag to stop trajectory execution
                     stopCurrentMotion();
-                    out.println("STOPPED");
+                    synchronized (outputLock) {
+                        if (out != null) {
+                            out.println("STOPPED");
+                        }
+                    }
                 } else if (line.equals("GET_POSE")) {
                     sendCurrentPose();
                 } else if (line.startsWith("SET_IMPEDANCE:")) {
@@ -146,11 +195,31 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     }
 
     private void executeTrajectory(String trajectoryData) {
+        if (robot == null) {
+            getLogger().error("Cannot execute trajectory: robot is null");
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("ERROR:ROBOT_NULL");
+                }
+            }
+            return;
+        }
+        
         isRunning.set(true);
         stopRequested.set(false);
         try {
             // Parse trajectory
             List<double[]> trajectory = parseTrajectory(trajectoryData);
+            if (trajectory.isEmpty()) {
+                getLogger().error("Trajectory is empty after parsing");
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println("ERROR:EMPTY_TRAJECTORY");
+                    }
+                }
+                return;
+            }
+            
             currentTrajectory = new ArrayList<double[]>(trajectory);
             currentTrajectoryIndex = 0;
             
@@ -162,15 +231,27 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 // Note: The exact method names may vary depending on your KUKA API version
                 // This will use default settings if custom setters are not available
                 getLogger().info("Using Cartesian impedance control with custom parameters for compliant trajectory execution");
-                getLogger().info("Stiffness: X=" + stiffnessX + ", Y=" + stiffnessY + ", Z=" + stiffnessZ + 
-                               ", RotX=" + stiffnessRot + ", RotY=" + stiffnessRot + ", RotZ=" + stiffnessRot);
-                getLogger().info("Damping: " + damping);
+                
+                // Read parameters with synchronization
+                double sx, sy, sz, srot, damp;
+                synchronized (this) {
+                    sx = stiffnessX;
+                    sy = stiffnessY;
+                    sz = stiffnessZ;
+                    srot = stiffnessRot;
+                    damp = damping;
+                }
+                
+                getLogger().info("Stiffness: X=" + sx + ", Y=" + sy + ", Z=" + sz + 
+                               ", RotX=" + srot + ", RotY=" + srot + ", RotZ=" + srot);
+                getLogger().info("Damping: " + damp);
             } catch (Exception e) {
                 getLogger().warn("Could not set custom impedance parameters, using defaults: " + e.getMessage());
             }
             
             // Execute trajectory with continuous impedance control for real-time deformation
             for (int i = 0; i < trajectory.size(); i++) {
+                // Check stop flag at the start of each iteration
                 if (stopRequested.get()) {
                     getLogger().info("Execution stopped by STOP command");
                     break;
@@ -199,53 +280,120 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 // Create Frame for Cartesian motion
                 Frame targetFrame = new Frame(x, y, z, alpha, beta, gamma);
                 
+                // Create impedance mode for this motion (allows parameter updates during execution)
+                CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
+                
+                // Cancel PositionHold before executing trajectory point
+                if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
+                    currentMotion.cancel();
+                }
+                
                 // Execute LIN motion with impedance control for compliance
-                currentMotion = robot.moveAsync(lin(targetFrame).setMode(impedanceMode));
+                // Robot remains compliant during motion for physical interaction
+                currentMotion = robot.moveAsync(lin(targetFrame).setMode(currentImpedanceMode));
                 
                 // Monitor execution and allow external force deformation
                 while (!currentMotion.isFinished() && !stopRequested.get()) {
                     try {
+                        // Check stop flag frequently during motion
+                        if (stopRequested.get()) {
+                            currentMotion.cancel();
+                            break;
+                        }
+                        
                         // Monitor external forces for deformation detection
                         // In impedance mode, the robot will naturally respond to external forces
+                        // Force data is sent continuously by background thread, no need to send here
                         
-                        // Send force data to Python controller if connected
-                        sendForceData();
-                        
-                        // Log that the robot is in compliant mode
-                        getLogger().info("Robot in compliant mode - can be pushed for deformation");
-                        
-                        // Small delay to allow external force response
+                        // Small delay to allow external force response and command processing
                         Thread.sleep(50); // 20 Hz monitoring
                         
+                    } catch (InterruptedException e) {
+                        getLogger().info("Motion monitoring interrupted");
+                        break;
                     } catch (Exception e) {
                         getLogger().error("Error during force monitoring: " + e.getMessage());
                         break;
                     }
                 }
                 
-                // Don't wait for motion to complete - let it be interrupted by external forces
-                // This allows real-time deformation during execution
+                // Check stop flag before moving to next point
+                if (stopRequested.get()) {
+                    getLogger().info("Execution stopped before completing trajectory");
+                    break;
+                }
                 
-                out.println("POINT_COMPLETE");
+                // Thread-safe output
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println("POINT_COMPLETE");
+                    }
+                }
             }
-            out.println("TRAJECTORY_COMPLETE");
+            
+            // Thread-safe output
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("TRAJECTORY_COMPLETE");
+                }
+            }
             getLogger().info("Trajectory execution complete");
+            
+            // Restart PositionHold to keep robot compliant after trajectory
+            restartPositionHold();
+            
         } catch (Exception e) {
             getLogger().error("Error during trajectory execution: " + e.getMessage());
-            out.println("ERROR: " + e.getMessage());
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("ERROR: " + e.getMessage());
+                }
+            }
+            
+            // Restart PositionHold even if trajectory failed
+            restartPositionHold();
         } finally {
             isRunning.set(false);
         }
     }
     
+    /**
+     * Restart PositionHold with impedance control to keep robot compliant
+     * This ensures the robot is always ready for physical interaction
+     */
+    private void restartPositionHold() {
+        try {
+            if (robot == null || positionHold == null) {
+                return;
+            }
+            
+            // Cancel any existing motion
+            if (currentMotion != null && !currentMotion.isFinished()) {
+                currentMotion.cancel();
+            }
+            
+            // Restart PositionHold with impedance control
+            currentMotion = robot.moveAsync(positionHold);
+            getLogger().info("PositionHold restarted - robot remains compliant");
+        } catch (Exception e) {
+            getLogger().error("Error restarting PositionHold: " + e.getMessage());
+        }
+    }
+    
     private void sendForceData() {
         try {
-            // Get external force/torque data (if available in your KUKA API)
+            if (robot == null) {
+                return;
+            }
+            
+            // Get real external force/torque data from KUKA LBR IIWA force sensor
+            ForceSensorData forceData = robot.getExternalForceTorque(robot.getFlange());
+            
             // Format: timestamp,fx,fy,fz,tx,ty,tz
-            String forceMsg = String.format("%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
+            String forceMsg = String.format(Locale.US, "%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
                 System.currentTimeMillis(),
-                0.0, 0.0, 0.0,  // Placeholder for force data
-                0.0, 0.0, 0.0); // Placeholder for torque data
+                forceData.getForce().getX(), forceData.getForce().getY(), forceData.getForce().getZ(),
+                forceData.getTorque().getX(), forceData.getTorque().getY(), forceData.getTorque().getZ());
             
             // Send to Python controller if connection is available
             if (forceDataOut != null) {
@@ -253,41 +401,69 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             }
             
         } catch (Exception e) {
-            // Force data not available, continue without it
+            // Log error but continue - force sensor might not be available in all configurations
+            getLogger().debug("Error reading force sensor data: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Continuous force data sender thread - sends force data at 100Hz
+     * This runs independently to provide real-time force feedback
+     */
+    private void continuousForceDataSender() {
+        while (forceDataThreadRunning.get()) {
+            try {
+                sendForceData();
+                Thread.sleep(10); // 100 Hz - matches demo recording frequency
+            } catch (InterruptedException e) {
+                getLogger().info("Force data thread interrupted");
+                break;
+            } catch (Exception e) {
+                getLogger().error("Error in force data thread: " + e.getMessage());
+                // Continue running even if there's an error
+                try {
+                    Thread.sleep(100); // Slow down on error
+                } catch (InterruptedException ie) {
+                    break;
+                }
+            }
         }
     }
 
     private void stopCurrentMotion() {
         stopRequested.set(true);
-        if (currentMotion != null && !currentMotion.isFinished()) {
-            currentMotion.cancel();
-        }
         isRunning.set(false);
         
-        // Close force data connection
-        if (forceDataOut != null) {
-            forceDataOut.close();
+        if (currentMotion != null && !currentMotion.isFinished()) {
+            currentMotion.cancel();
+            getLogger().info("Current motion cancelled");
         }
-        if (forceDataSocket != null && !forceDataSocket.isClosed()) {
-            try {
-                forceDataSocket.close();
-            } catch (IOException e) {
-                getLogger().error("Error closing force data socket: " + e.getMessage());
-            }
-        }
+        
+        // Restart PositionHold to keep robot compliant after stop
+        restartPositionHold();
+        
+        // Note: Don't close force data connection here as it may still be needed
+        // Only close on application shutdown
     }
 
     private void startDemoRecording() {
-        if (isRecordingDemo) {
+        if (isRecordingDemo.get()) {
             getLogger().warn("Demo recording already in progress");
             return;
         }
         
-        isRecordingDemo = true;
-        currentDemo.clear();
+        isRecordingDemo.set(true);
+        synchronized (currentDemo) {
+            currentDemo.clear();
+        }
         demoStartTime = System.currentTimeMillis();
         getLogger().info("Started demo recording");
-        out.println("DEMO_RECORDING_STARTED");
+        
+        synchronized (outputLock) {
+            if (out != null) {
+                out.println("DEMO_RECORDING_STARTED");
+            }
+        }
         
         // Start recording thread
         new Thread(new Runnable() {
@@ -299,22 +475,36 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     }
     
     private void stopDemoRecording() {
-        if (!isRecordingDemo) {
+        if (!isRecordingDemo.get()) {
             getLogger().warn("No demo recording in progress");
             return;
         }
         
-        isRecordingDemo = false;
-        if (currentDemo.size() > 0) {
-            allDemos.add(new ArrayList<double[]>(currentDemo));
-            getLogger().info("Stopped demo recording. Total demos: " + allDemos.size() + ", Current demo points: " + currentDemo.size());
+        isRecordingDemo.set(false);
+        synchronized (currentDemo) {
+            if (currentDemo.size() > 0) {
+                synchronized (allDemos) {
+                    allDemos.add(new ArrayList<double[]>(currentDemo));
+                }
+                getLogger().info("Stopped demo recording. Total demos: " + allDemos.size() + ", Current demo points: " + currentDemo.size());
+            }
         }
-        out.println("DEMO_RECORDING_STOPPED");
+        
+        synchronized (outputLock) {
+            if (out != null) {
+                out.println("DEMO_RECORDING_STOPPED");
+            }
+        }
     }
     
     private void recordDemoData() {
-        while (isRecordingDemo) {
+        while (isRecordingDemo.get()) {
             try {
+                if (robot == null) {
+                    getLogger().error("Robot is null, cannot record demo data");
+                    break;
+                }
+                
                 // Get current Cartesian pose
                 Frame currentFrame = robot.getCurrentCartesianPosition(robot.getFlange());
                 double[] pose = {
@@ -322,11 +512,16 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     currentFrame.getAlphaRad(), currentFrame.getBetaRad(), currentFrame.getGammaRad()
                 };
                 
-                currentDemo.add(pose);
+                synchronized (currentDemo) {
+                    currentDemo.add(pose);
+                }
                 
                 // Record at 100Hz
                 Thread.sleep(10);
                 
+            } catch (InterruptedException e) {
+                getLogger().info("Demo recording interrupted");
+                break;
             } catch (Exception e) {
                 getLogger().error("Error recording demo data: " + e.getMessage());
                 break;
@@ -336,50 +531,99 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     
     private void sendDemos() {
         try {
-            // Convert demos to string format
+            if (out == null) {
+                getLogger().error("Output stream is null, cannot send demos");
+                return;
+            }
+            
+            // Convert demos to string format matching Python expectations
+            // Format: DEMOS:DEMO_0:pose1;pose2;...|DEMO_1:pose1;pose2;...|
             StringBuilder demosStr = new StringBuilder();
             demosStr.append("DEMOS:");
             
-            for (int i = 0; i < allDemos.size(); i++) {
-                List<double[]> demo = allDemos.get(i);
-                demosStr.append("DEMO_").append(i).append(":");
-                
-                for (double[] pose : demo) {
-                    demosStr.append(String.format("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f;", 
-                        pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]));
+            synchronized (allDemos) {
+                for (int i = 0; i < allDemos.size(); i++) {
+                    List<double[]> demo = allDemos.get(i);
+                    demosStr.append("DEMO_").append(i).append(":");
+                    
+                    for (double[] pose : demo) {
+                        // Format: x,y,z,alpha,beta,gamma (comma-separated, no semicolon at end of pose)
+                        demosStr.append(String.format("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f", 
+                            pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]));
+                        demosStr.append(";");  // Semicolon between poses
+                    }
+                    if (i < allDemos.size() - 1) {
+                        demosStr.append("|");  // Pipe between demos
+                    }
                 }
-                demosStr.append("|");
             }
             
-            out.println(demosStr.toString());
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println(demosStr.toString());
+                }
+            }
             getLogger().info("Sent " + allDemos.size() + " demos");
             
         } catch (Exception e) {
             getLogger().error("Error sending demos: " + e.getMessage());
-            out.println("ERROR:SENDING_DEMOS");
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("ERROR:SENDING_DEMOS");
+                }
+            }
         }
     }
     
     private void clearDemos() {
-        allDemos.clear();
-        currentDemo.clear();
+        synchronized (allDemos) {
+            allDemos.clear();
+        }
+        synchronized (currentDemo) {
+            currentDemo.clear();
+        }
         getLogger().info("All demos cleared");
-        out.println("DEMOS_CLEARED");
+        synchronized (outputLock) {
+            if (out != null) {
+                out.println("DEMOS_CLEARED");
+            }
+        }
     }
     
     private void sendCurrentPose() {
         try {
+            if (robot == null) {
+                getLogger().error("Robot is null, cannot get current pose");
+                if (out != null) {
+                    out.println("ERROR:ROBOT_NULL");
+                }
+                return;
+            }
+            
+            if (out == null) {
+                getLogger().error("Output stream is null, cannot send pose");
+                return;
+            }
+            
             Frame currentFrame = robot.getCurrentCartesianPosition(robot.getFlange());
             String poseResponse = String.format("POSE:%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
                 currentFrame.getX(), currentFrame.getY(), currentFrame.getZ(),
                 currentFrame.getAlphaRad(), currentFrame.getBetaRad(), currentFrame.getGammaRad());
             
-            out.println(poseResponse);
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println(poseResponse);
+                }
+            }
             getLogger().info("Sent current pose: " + poseResponse);
             
         } catch (Exception e) {
             getLogger().error("Error sending current pose: " + e.getMessage());
-            out.println("ERROR:POSE_RETRIEVAL_FAILED");
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("ERROR:POSE_RETRIEVAL_FAILED");
+                }
+            }
         }
     }
     
@@ -387,17 +631,77 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         try {
             String[] params = parameters.split(",");
             if (params.length >= 4) {
-                stiffnessX = Double.parseDouble(params[0]);
-                stiffnessY = Double.parseDouble(params[1]);
-                stiffnessZ = Double.parseDouble(params[2]);
-                damping = Double.parseDouble(params[3]);
+                // Update parameters atomically
+                synchronized (this) {
+                    stiffnessX = Double.parseDouble(params[0]);
+                    stiffnessY = Double.parseDouble(params[1]);
+                    stiffnessZ = Double.parseDouble(params[2]);
+                    damping = Double.parseDouble(params[3]);
+                }
                 
                 getLogger().info("Impedance parameters updated: Kx=" + stiffnessX + ", Ky=" + stiffnessY + 
                                ", Kz=" + stiffnessZ + ", Damping=" + damping);
-                out.println("IMPEDANCE_UPDATED");
+                
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println("IMPEDANCE_UPDATED");
+                    }
+                }
+                
+                // If currently executing, the next motion will use new parameters
+                if (isRunning.get()) {
+                    getLogger().info("New impedance parameters will apply to next trajectory point");
+                }
             }
         } catch (NumberFormatException e) {
             getLogger().error("Error parsing impedance parameters: " + e.getMessage());
         }
+    }
+    
+    @Override
+    public void dispose() {
+        getLogger().info("Shutting down application...");
+        
+        // Stop force data thread
+        forceDataThreadRunning.set(false);
+        
+        // Stop any running motion
+        stopRequested.set(true);
+        if (currentMotion != null && !currentMotion.isFinished()) {
+            currentMotion.cancel();
+        }
+        
+        // Close force data connection
+        try {
+            if (forceDataOut != null) {
+                forceDataOut.close();
+            }
+            if (forceDataSocket != null && !forceDataSocket.isClosed()) {
+                forceDataSocket.close();
+            }
+        } catch (IOException e) {
+            getLogger().error("Error closing force data socket: " + e.getMessage());
+        }
+        
+        // Close main socket connections
+        try {
+            if (out != null) {
+                out.close();
+            }
+            if (in != null) {
+                in.close();
+            }
+            if (clientSocket != null && !clientSocket.isClosed()) {
+                clientSocket.close();
+            }
+            if (serverSocket != null && !serverSocket.isClosed()) {
+                serverSocket.close();
+            }
+        } catch (IOException e) {
+            getLogger().error("Error closing sockets: " + e.getMessage());
+        }
+        
+        getLogger().info("Application shutdown complete");
+        super.dispose();
     }
 } 
