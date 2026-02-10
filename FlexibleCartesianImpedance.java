@@ -4,6 +4,7 @@ import com.kuka.roboticsAPI.deviceModel.JointPosition;
 import com.kuka.roboticsAPI.motionModel.IMotionContainer;
 import com.kuka.roboticsAPI.motionModel.PositionHold;
 import com.kuka.roboticsAPI.motionModel.controlModeModel.CartesianImpedanceControlMode;
+import com.kuka.roboticsAPI.motionModel.controlModeModel.JointImpedanceControlMode;
 import com.kuka.roboticsAPI.geometricModel.Frame;
 import com.kuka.roboticsAPI.motionModel.PTP;
 import com.kuka.roboticsAPI.motionModel.LIN;
@@ -87,23 +88,25 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().error("Failed to move to initial position: " + e.getMessage());
         }
         
-        // Setup continuous Cartesian impedance control for physical interaction
+        // Setup PositionHold with joint impedance control for compliant waiting
+        // This matches cartesianimpedance.java - uses JointImpedanceControlMode with zero stiffness
+        getLogger().info("Setting up PositionHold with impedance control for compliant waiting...");
         try {
-            getLogger().info("Setting up continuous Cartesian impedance control...");
-            getLogger().info("Loaded impedance parameters: Stiffness X=" + stiffnessX + 
-                           ", Y=" + stiffnessY + ", Z=" + stiffnessZ + 
-                           ", Rot=" + stiffnessRot + ", Damping=" + damping);
+            // Use JointImpedanceControlMode with zero stiffness for compliance (like cartesianimpedance.java)
+            JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            impedanceMode.setStiffnessForAllJoints(0.0); // Very low stiffness for compliance
+            getLogger().info("JointImpedanceControlMode created successfully");
             
-            // Create Cartesian impedance control mode
-            // Note: The KUKA API may apply these parameters automatically or through configuration
-            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
-            
-            // Create PositionHold with impedance control - keeps robot compliant at all times
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
+            getLogger().info("PositionHold created successfully");
+            
+            // Start PositionHold to keep robot compliant while waiting
+            getLogger().info("Starting PositionHold - robot should now be compliant");
             currentMotion = robot.moveAsync(positionHold);
-            getLogger().info("Cartesian impedance control activated - robot is now compliant for physical interaction");
+            getLogger().info("PositionHold started successfully - robot is now compliant for physical interaction");
+            
         } catch (Exception e) {
-            getLogger().error("Failed to setup impedance control: " + e.getMessage());
+            getLogger().error("Failed to setup PositionHold with impedance control: " + e.getMessage());
             e.printStackTrace();
         }
         
@@ -360,8 +363,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     }
     
     /**
-     * Restart PositionHold with impedance control to keep robot compliant
+     * Restart PositionHold with joint impedance control to keep robot compliant
      * This ensures the robot is always ready for physical interaction
+     * Uses JointImpedanceControlMode with zero stiffness (like cartesianimpedance.java)
      */
     private void restartPositionHold() {
         try {
@@ -374,16 +378,13 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 currentMotion.cancel();
             }
             
-            // Create new Cartesian impedance control mode
-            // Parameters are loaded from data.xml configuration
-            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
+            // Use JointImpedanceControlMode with zero stiffness for compliance (like cartesianimpedance.java)
+            JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            impedanceMode.setStiffnessForAllJoints(0.0); // Very low stiffness for compliance
             
-            getLogger().info("Restarting PositionHold with Cartesian impedance control");
-            getLogger().info("Current impedance parameters: Stiffness X=" + stiffnessX + 
-                           ", Y=" + stiffnessY + ", Z=" + stiffnessZ + 
-                           ", Rot=" + stiffnessRot + ", Damping=" + damping);
+            getLogger().info("Restarting PositionHold with joint impedance control (zero stiffness)");
             
-            // Create new PositionHold with impedance control
+            // Create new PositionHold with joint impedance control
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
             currentMotion = robot.moveAsync(positionHold);
             getLogger().info("PositionHold restarted - robot remains compliant");
