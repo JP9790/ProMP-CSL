@@ -27,10 +27,10 @@ class InteractiveDemoRecorder(Node):
         super().__init__('interactive_demo_recorder')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '172.31.1.147')
+        self.declare_parameter('kuka_ip', '192.170.10.25')
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('torque_port', 30003)
-        self.declare_parameter('ros2_pc_ip', '172.31.1.25')
+        self.declare_parameter('ros2_pc_ip', '192.170.10.1')
         self.declare_parameter('record_frequency', 100.0)  # Hz
         self.declare_parameter('demo_duration', 10.0)  # seconds
         self.declare_parameter('num_basis_functions', 50)
@@ -165,45 +165,69 @@ class InteractiveDemoRecorder(Node):
     def stop_recording(self):
         """Stop recording current demonstration"""
         if not self.is_recording:
+            self.get_logger().warn("No recording in progress")
             return
             
+        self.get_logger().info("Stopping demo recording...")
         self.is_recording = False
-        if self.recording_thread:
-            self.recording_thread.join()
         
-        if len(self.current_demo) > 0:
-            self.demos.append(np.array(self.current_demo))
-            self.get_logger().info(f'Demo #{self.demo_counter} recorded with {len(self.current_demo)} points')
+        # Wait for recording thread to finish stopping Java recording
+        if self.recording_thread:
+            self.recording_thread.join(timeout=5.0)  # Wait up to 5 seconds
+            if self.recording_thread.is_alive():
+                self.get_logger().warn("Recording thread did not finish in time")
+        
+        # Retrieve demos from Java app (Java records internally)
+        if self.kuka_connected:
+            self.get_logger().info("Retrieving demos from Java app...")
+            if self.retrieve_demos_from_java():
+                self.get_logger().info(f"Successfully retrieved {len(self.demos)} demos from Java")
+            else:
+                self.get_logger().error("Failed to retrieve demos from Java app")
+        
+        # Save demos if we have any
+        if len(self.demos) > 0:
+            latest_demo = self.demos[-1]
+            self.get_logger().info(f'Demo #{self.demo_counter} recorded with {len(latest_demo)} points')
             
             # Auto-save individual demo
             if self.auto_save:
-                self.save_individual_demo(self.current_demo, self.demo_counter)
+                self.save_individual_demo(latest_demo, self.demo_counter)
             
             # Save all demos
             self.save_all_demos()
+        else:
+            self.get_logger().warn("No demos retrieved from Java app")
         
         self.status_pub.publish(String(data=f'DEMO_{self.demo_counter}_COMPLETED'))
     
     def record_demo_thread(self):
         """Thread for recording demonstration data using the new Java app commands"""
-        start_time = time.time()
-        dt = 1.0 / self.record_freq
-        
         # Start demo recording on the Java app
         if self.kuka_connected:
             try:
                 self.kuka_socket.sendall(b'START_DEMO_RECORDING\n')
-                response = self.kuka_socket.recv(1024).decode('utf-8').strip()
-                if response == "DEMO_RECORDING_STARTED":
+                # Read response - may need multiple recv calls for complete message
+                response = self._receive_complete_message(self.kuka_socket, timeout=5.0)
+                if response and response.strip() == "DEMO_RECORDING_STARTED":
                     self.get_logger().info("Demo recording started on Java app")
                 else:
                     self.get_logger().error(f"Failed to start demo recording: {response}")
+                    self.is_recording = False
                     return
             except Exception as e:
                 self.get_logger().error(f"Error starting demo recording: {e}")
+                self.is_recording = False
                 return
+        else:
+            self.get_logger().error("Not connected to KUKA - cannot start recording")
+            self.is_recording = False
+            return
         
-        while self.is_recording and (time.time() - start_time) < self.demo_duration:
+        # Wait while recording - Java app records internally
+        # Recording continues until is_recording is set to False (by stop_recording() or user)
+        dt = 1.0 / self.record_freq
+        while self.is_recording:
             try:
                 # The Java app is now recording the demo data internally
                 # We just need to wait and monitor the recording
@@ -217,8 +241,8 @@ class InteractiveDemoRecorder(Node):
         if self.kuka_connected:
             try:
                 self.kuka_socket.sendall(b'STOP_DEMO_RECORDING\n')
-                response = self.kuka_socket.recv(1024).decode('utf-8').strip()
-                if response == "DEMO_RECORDING_STOPPED":
+                response = self._receive_complete_message(self.kuka_socket, timeout=5.0)
+                if response and response.strip() == "DEMO_RECORDING_STOPPED":
                     self.get_logger().info("Demo recording stopped on Java app")
                 else:
                     self.get_logger().error(f"Failed to stop demo recording: {response}")
@@ -234,7 +258,13 @@ class InteractiveDemoRecorder(Node):
         try:
             # Request all demos from Java app
             self.kuka_socket.sendall(b'GET_DEMOS\n')
-            response = self.kuka_socket.recv(8192).decode('utf-8').strip()  # Larger buffer for demos
+            # Use larger buffer and receive complete message (demos can be large)
+            response = self._receive_complete_message(self.kuka_socket, timeout=10.0, buffer_size=65536)
+            if not response:
+                self.get_logger().error("No response received from Java app")
+                return False
+            
+            response = response.strip()
             
             if response.startswith('DEMOS:'):
                 # Parse the demos from Java app
@@ -246,14 +276,24 @@ class InteractiveDemoRecorder(Node):
                 for section in demo_sections:
                     if section.strip() and section.startswith('DEMO_'):
                         # Parse individual demo
-                        demo_lines = section.split(';')
+                        # Remove "DEMO_X:" prefix first
+                        colon_idx = section.find(':')
+                        if colon_idx == -1:
+                            continue
+                        poses_str = section[colon_idx + 1:]  # Get everything after "DEMO_X:"
+                        
+                        demo_lines = poses_str.split(';')
                         demo_data = []
                         
                         for line in demo_lines:
                             if line.strip() and ',' in line:
-                                pose_values = [float(x) for x in line.split(',')]
-                                if len(pose_values) >= 6:
-                                    demo_data.append(pose_values[:6])  # x, y, z, alpha, beta, gamma
+                                try:
+                                    pose_values = [float(x) for x in line.split(',')]
+                                    if len(pose_values) >= 6:
+                                        demo_data.append(pose_values[:6])  # x, y, z, alpha, beta, gamma
+                                except ValueError:
+                                    # Skip invalid pose data
+                                    continue
                         
                         if demo_data:
                             self.demos.append(demo_data)
@@ -310,8 +350,9 @@ class InteractiveDemoRecorder(Node):
 
     def save_all_demos(self, filename=None):
         """Save all demonstrations to all_demos.npy (overwrite)"""
-        # First retrieve demos from Java app
-        if self.kuka_connected:
+        # Demos should already be retrieved in stop_recording(), but retrieve again to be sure
+        if self.kuka_connected and len(self.demos) == 0:
+            self.get_logger().info("No demos in memory, retrieving from Java app...")
             if not self.retrieve_demos_from_java():
                 self.get_logger().error("Failed to retrieve demos from Java app")
                 return None
@@ -376,6 +417,34 @@ class InteractiveDemoRecorder(Node):
     # def normalize_demos(self): ...
     # etc.
 
+    def _receive_complete_message(self, sock, timeout=5.0, buffer_size=8192):
+        """
+        Receive complete message from socket, handling multi-packet messages.
+        Assumes messages end with newline character.
+        """
+        try:
+            sock.settimeout(timeout)
+            message_parts = []
+            
+            while True:
+                data = sock.recv(buffer_size)
+                if not data:
+                    break
+                
+                message_parts.append(data.decode('utf-8'))
+                
+                # Check if we received a complete line (ends with newline)
+                if b'\n' in data:
+                    break
+            
+            return ''.join(message_parts)
+        except socket.timeout:
+            self.get_logger().warn(f"Timeout waiting for response (>{timeout}s)")
+            return None
+        except Exception as e:
+            self.get_logger().error(f"Error receiving message: {e}")
+            return None
+    
     def timer_callback(self):
         """Periodic timer callback"""
         # Publish status
@@ -431,12 +500,19 @@ def main(args=None):
             command = input("\nEnter command: ").strip().lower()
             
             if command == 'start':
-                print("Starting demo recording... (Press Ctrl+C to stop)")
-                node.start_recording()
+                if node.is_recording:
+                    print("Recording already in progress. Use 'stop' to stop recording.")
+                else:
+                    print("Starting demo recording... (Type 'stop' to stop recording)")
+                    node.start_recording()
                 
             elif command == 'stop':
-                print("Stopping demo recording...")
-                node.stop_recording()
+                if not node.is_recording:
+                    print("No recording in progress.")
+                else:
+                    print("Stopping demo recording...")
+                    node.stop_recording()
+                    print("Demo recording stopped. Demos retrieved and saved.")
                 
             elif command == 'info':
                 info = node.get_demo_info()
