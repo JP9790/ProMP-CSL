@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import os
 from .promp import ProMP
 import argparse
+import math
 
 class TrainAndExecute(Node):
     def __init__(self):
@@ -55,6 +56,7 @@ class TrainAndExecute(Node):
         # ProMP and trajectory
         self.promp = None
         self.learned_trajectory = None
+        self.learned_joint_trajectory = None  # Joint space trajectory
         self.demos = []
         
         # Normalization statistics for denormalizing generated trajectories
@@ -62,6 +64,9 @@ class TrainAndExecute(Node):
         self.demo_max = None
         self.demo_mean = None
         self.demo_std = None
+        
+        # Trajectory save directory
+        self.trajectory_save_dir = os.path.expanduser('~/newfoldername')
         
         # TCP communication
         self.kuka_socket = None
@@ -91,6 +96,63 @@ class TrainAndExecute(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to connect to KUKA: {e}')
             self.kuka_socket = None
+    
+    def cartesian_to_joint_via_java(self, cartesian_poses):
+        """Convert Cartesian poses to joint positions by requesting IK from Java"""
+        if self.kuka_socket is None:
+            self.get_logger().error('No connection to KUKA robot for IK conversion')
+            return None
+        
+        try:
+            joint_positions = []
+            failed_count = 0
+            
+            self.get_logger().info(f'Converting {len(cartesian_poses)} Cartesian poses to joint positions via Java IK...')
+            
+            for i, pose in enumerate(cartesian_poses):
+                x, y, z, alpha, beta, gamma = pose
+                
+                # Request IK conversion from Java
+                ik_command = f"GET_JOINT_POS:{x:.6f},{y:.6f},{z:.6f},{alpha:.6f},{beta:.6f},{gamma:.6f}\n"
+                self.kuka_socket.sendall(ik_command.encode('utf-8'))
+                
+                # Wait for response
+                response = self._receive_complete_message(self.kuka_socket, timeout=2.0)
+                if response and response.startswith("JOINT_POS:"):
+                    # Parse joint positions: "JOINT_POS:j1,j2,j3,j4,j5,j6,j7"
+                    joint_str = response.split("JOINT_POS:")[1].strip()
+                    joint_vals = [float(v) for v in joint_str.split(",")]
+                    if len(joint_vals) == 7:
+                        joint_positions.append(joint_vals)
+                    else:
+                        self.get_logger().warn(f'Invalid joint position response for point {i}: {response}')
+                        failed_count += 1
+                elif response and "ERROR" in response:
+                    self.get_logger().warn(f'IK failed for point {i}: {response}')
+                    failed_count += 1
+                else:
+                    self.get_logger().warn(f'Unexpected response for point {i}: {response}')
+                    failed_count += 1
+                
+                # Progress update
+                if (i + 1) % 10 == 0:
+                    self.get_logger().info(f'IK conversion progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
+            
+            if len(joint_positions) == len(cartesian_poses):
+                self.get_logger().info(f'Successfully converted all {len(cartesian_poses)} poses to joint positions')
+                return np.array(joint_positions)
+            elif len(joint_positions) > 0:
+                self.get_logger().warn(f'Converted {len(joint_positions)}/{len(cartesian_poses)} poses ({failed_count} failed)')
+                return np.array(joint_positions)
+            else:
+                self.get_logger().error('Failed to convert any poses to joint positions')
+                return None
+                
+        except Exception as e:
+            self.get_logger().error(f'Error converting Cartesian to joint: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return None
     
     def _receive_complete_message(self, sock, timeout=5.0, buffer_size=8192):
         """
@@ -404,7 +466,7 @@ class TrainAndExecute(Node):
         plt.show()
     
     def send_trajectory_to_kuka(self):
-        """Send learned trajectory to KUKA robot"""
+        """Send learned trajectory to KUKA robot (using joint positions to avoid workspace errors)"""
         if self.learned_trajectory is None:
             self.get_logger().error('No learned trajectory available')
             return False
@@ -420,14 +482,26 @@ class TrainAndExecute(Node):
                 self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
                 return False
             
-            # Format trajectory for KUKA: x,y,z,alpha,beta,gamma separated by semicolons
-            # Format: "TRAJECTORY:x1,y1,z1,a1,b1,g1;x2,y2,z2,a2,b2,g2;..."
+            # Convert Cartesian to joint positions using Java IK solver
+            # This prevents workspace errors by ensuring all points are reachable
+            self.get_logger().info('Converting Cartesian trajectory to joint positions...')
+            joint_trajectory = self.cartesian_to_joint_via_java(self.learned_trajectory)
+            
+            if joint_trajectory is None or len(joint_trajectory) == 0:
+                self.get_logger().error('Failed to convert trajectory to joint positions')
+                return False
+            
+            # Store joint trajectory
+            self.learned_joint_trajectory = joint_trajectory
+            
+            # Format joint trajectory for KUKA: j1,j2,j3,j4,j5,j6,j7 separated by semicolons
+            # Format: "JOINT_TRAJECTORY:j1_1,j2_1,j3_1,j4_1,j5_1,j6_1,j7_1;j1_2,j2_2,..."
             trajectory_str = ";".join([
-                ",".join([f"{val:.6f}" for val in point]) for point in self.learned_trajectory
+                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
             ])
             
-            command = f"TRAJECTORY:{trajectory_str}\n"
-            self.get_logger().info(f'Sending trajectory to KUKA ({len(self.learned_trajectory)} points)...')
+            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
+            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
             self.kuka_socket.sendall(command.encode('utf-8'))
             
             # Wait for completion - handle fragmented responses and skip errors
@@ -478,11 +552,35 @@ class TrainAndExecute(Node):
             self.get_logger().error(traceback.format_exc())
             return False
     
-    def save_learned_trajectory(self, filename='learned_trajectory.npy'):
-        """Save learned trajectory to file"""
-        if self.learned_trajectory is not None:
-            np.save(filename, self.learned_trajectory)
-            self.get_logger().info(f'Learned trajectory saved to {filename}')
+    def save_learned_trajectory(self, filename=None):
+        """Save learned trajectory to ~/newfoldername"""
+        if self.learned_trajectory is None:
+            self.get_logger().warn('No learned trajectory to save')
+            return False
+        
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(self.trajectory_save_dir, exist_ok=True)
+            
+            # Save Cartesian trajectory
+            if filename is None:
+                cartesian_file = os.path.join(self.trajectory_save_dir, 'learned_trajectory.npy')
+            else:
+                cartesian_file = os.path.join(self.trajectory_save_dir, filename)
+            
+            np.save(cartesian_file, self.learned_trajectory)
+            self.get_logger().info(f'Learned Cartesian trajectory saved to {cartesian_file}')
+            
+            # Save joint trajectory if available
+            if self.learned_joint_trajectory is not None:
+                joint_file = os.path.join(self.trajectory_save_dir, 'learned_joint_trajectory.npy')
+                np.save(joint_file, self.learned_joint_trajectory)
+                self.get_logger().info(f'Learned joint trajectory saved to {joint_file}')
+            
+            return True
+        except Exception as e:
+            self.get_logger().error(f'Error saving learned trajectory: {e}')
+            return False
     
     def load_learned_trajectory(self, filename='learned_trajectory.npy'):
         """Load learned trajectory from file"""

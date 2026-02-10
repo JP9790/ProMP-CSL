@@ -162,6 +162,19 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                             executeTrajectory(trajData);
                         }
                     }).start();
+                } else if (line.startsWith("JOINT_TRAJECTORY:")) {
+                    // Execute joint trajectory in separate thread
+                    final String jointTrajData = line.substring("JOINT_TRAJECTORY:".length());
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            executeJointTrajectory(jointTrajData);
+                        }
+                    }).start();
+                } else if (line.startsWith("GET_JOINT_POS:")) {
+                    // Convert Cartesian position to joint position (IK)
+                    String cartPosStr = line.substring("GET_JOINT_POS:".length());
+                    handleGetJointPosition(cartPosStr);
                 } else if (line.equals("STOP")) {
                     stopRequested.set(true);  // Set flag to stop trajectory execution
                     stopCurrentMotion();
@@ -756,6 +769,215 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     out.println("ERROR:POSE_RETRIEVAL_FAILED");
                 }
             }
+        }
+    }
+    
+    /**
+     * Handle GET_JOINT_POS command: Convert Cartesian position to joint position using IK
+     * Format: "GET_JOINT_POS:x,y,z,alpha,beta,gamma"
+     * Response: "JOINT_POS:j1,j2,j3,j4,j5,j6,j7" or "ERROR:IK_FAILED"
+     */
+    private void handleGetJointPosition(String cartPosStr) {
+        try {
+            if (robot == null) {
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println("ERROR:ROBOT_NULL");
+                    }
+                }
+                return;
+            }
+            
+            // Parse Cartesian position
+            String[] coords = cartPosStr.split(",");
+            if (coords.length != 6) {
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println("ERROR:INVALID_FORMAT");
+                    }
+                }
+                return;
+            }
+            
+            double x = Double.parseDouble(coords[0]);
+            double y = Double.parseDouble(coords[1]);
+            double z = Double.parseDouble(coords[2]);
+            double alpha = Double.parseDouble(coords[3]);
+            double beta = Double.parseDouble(coords[4]);
+            double gamma = Double.parseDouble(coords[5]);
+            
+            // Create Frame
+            Frame targetFrame = new Frame(x, y, z, alpha, beta, gamma);
+            
+            // Use robot's IK solver to get joint position
+            // Note: getInverseKinematics() may throw exception if position is unreachable
+            try {
+                JointPosition jointPos = robot.getInverseKinematics(targetFrame, robot.getFlange());
+                
+                // Format response: "JOINT_POS:j1,j2,j3,j4,j5,j6,j7"
+                String response = String.format("JOINT_POS:%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                    jointPos.get(0), jointPos.get(1), jointPos.get(2), jointPos.get(3),
+                    jointPos.get(4), jointPos.get(5), jointPos.get(6));
+                
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println(response);
+                    }
+                }
+                
+            } catch (Exception e) {
+                // IK failed - position is unreachable
+                getLogger().warn("IK failed for position: " + targetFrame + " - " + e.getMessage());
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println("ERROR:IK_FAILED:" + e.getMessage());
+                    }
+                }
+            }
+            
+        } catch (Exception e) {
+            getLogger().error("Error handling GET_JOINT_POS: " + e.getMessage());
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("ERROR:PARSING_FAILED");
+                }
+            }
+        }
+    }
+    
+    /**
+     * Execute trajectory using joint positions (PTP motion)
+     * This avoids workspace errors since joint positions are guaranteed to be valid
+     * Format: "JOINT_TRAJECTORY:j1_1,j2_1,...,j7_1;j1_2,j2_2,...,j7_2;..."
+     */
+    private void executeJointTrajectory(String jointTrajData) {
+        if (robot == null) {
+            getLogger().error("Cannot execute joint trajectory: robot is null");
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("ERROR:ROBOT_NULL");
+                }
+            }
+            return;
+        }
+        
+        isRunning.set(true);
+        stopRequested.set(false);
+        
+        try {
+            // Parse joint trajectory
+            List<JointPosition> jointTrajectory = new ArrayList<JointPosition>();
+            String[] points = jointTrajData.split(";");
+            
+            for (String pt : points) {
+                String[] vals = pt.split(",");
+                if (vals.length == 7) {
+                    JointPosition jointPos = new JointPosition(
+                        Double.parseDouble(vals[0]),
+                        Double.parseDouble(vals[1]),
+                        Double.parseDouble(vals[2]),
+                        Double.parseDouble(vals[3]),
+                        Double.parseDouble(vals[4]),
+                        Double.parseDouble(vals[5]),
+                        Double.parseDouble(vals[6])
+                    );
+                    jointTrajectory.add(jointPos);
+                }
+            }
+            
+            if (jointTrajectory.isEmpty()) {
+                getLogger().error("Joint trajectory is empty after parsing");
+                synchronized (outputLock) {
+                    if (out != null) {
+                        out.println("ERROR:EMPTY_TRAJECTORY");
+                    }
+                }
+                return;
+            }
+            
+            getLogger().info("Executing joint trajectory with " + jointTrajectory.size() + " points");
+            
+            // Execute joint trajectory using PTP (Point-to-Point) motion
+            // PTP with joint positions avoids workspace errors
+            for (int i = 0; i < jointTrajectory.size(); i++) {
+                if (stopRequested.get()) {
+                    getLogger().info("Joint trajectory execution stopped");
+                    break;
+                }
+                
+                JointPosition targetJoint = jointTrajectory.get(i);
+                
+                try {
+                    // Cancel PositionHold before executing
+                    if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
+                        currentMotion.cancel();
+                    }
+                    
+                    // Use JointImpedanceControlMode for compliant PTP motion
+                    JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(
+                        positionHoldStiffness, positionHoldStiffness, positionHoldStiffness,
+                        positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, positionHoldStiffness
+                    );
+                    impedanceMode.setStiffnessForAllJoints(positionHoldStiffness);
+                    
+                    // Execute PTP motion with impedance control
+                    currentMotion = robot.moveAsync(ptp(targetJoint).setMode(impedanceMode));
+                    
+                    // Wait for motion to complete
+                    while (!currentMotion.isFinished() && !stopRequested.get()) {
+                        try {
+                            Thread.sleep(50); // 20 Hz monitoring
+                        } catch (InterruptedException e) {
+                            break;
+                        }
+                    }
+                    
+                    if (stopRequested.get()) {
+                        currentMotion.cancel();
+                        break;
+                    }
+                    
+                    // Send point complete
+                    synchronized (outputLock) {
+                        if (out != null) {
+                            out.println("POINT_COMPLETE");
+                        }
+                    }
+                    
+                } catch (Exception e) {
+                    // Even with joint positions, motion might fail (e.g., axis limits)
+                    getLogger().warn("Point " + i + " execution failed: " + e.getMessage());
+                    synchronized (outputLock) {
+                        if (out != null) {
+                            out.println("ERROR:JOINT_MOTION_FAILED_POINT_" + i + ":" + e.getMessage());
+                        }
+                    }
+                    // Continue to next point
+                    continue;
+                }
+            }
+            
+            // Send completion
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("TRAJECTORY_COMPLETE");
+                }
+            }
+            getLogger().info("Joint trajectory execution complete");
+            
+            // Restart PositionHold
+            restartPositionHold();
+            
+        } catch (Exception e) {
+            getLogger().error("Error during joint trajectory execution: " + e.getMessage());
+            synchronized (outputLock) {
+                if (out != null) {
+                    out.println("ERROR:" + e.getMessage());
+                }
+            }
+            restartPositionHold();
+        } finally {
+            isRunning.set(false);
         }
     }
     
