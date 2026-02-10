@@ -15,11 +15,12 @@ class TrainAndExecute(Node):
         super().__init__('train_and_execute')
         
         # Parameters
-        self.declare_parameter('kuka_ip', '192.170.10.25')
+        # Note: kuka_ip should match the IP where Java app is running (typically robot controller IP)
+        self.declare_parameter('kuka_ip', '172.31.1.147')  # Default matches controller_ip from data.xml
         self.declare_parameter('kuka_port', 30002)
         self.declare_parameter('num_basis_functions', 50)
         self.declare_parameter('sigma_noise', 0.01)
-        self.declare_parameter('demo_file', 'demos.npy')
+        self.declare_parameter('demo_file', 'all_demos.npy')  # Default matches interactive_demo_recorder.py output
         self.declare_parameter('trajectory_points', 100)
         
         # Get parameters
@@ -47,48 +48,119 @@ class TrainAndExecute(Node):
     def setup_kuka_communication(self):
         """Setup TCP communication with KUKA robot"""
         try:
+            self.get_logger().info(f"Connecting to KUKA at {self.kuka_ip}:{self.kuka_port}...")
             self.kuka_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.kuka_socket.settimeout(5)  # 5 second timeout
             self.kuka_socket.connect((self.kuka_ip, self.kuka_port))
             
             # Wait for READY signal
-            ready = self.kuka_socket.recv(1024).decode('utf-8')
-            self.get_logger().info(f'KUKA connection established: {ready}')
+            ready = self._receive_complete_message(self.kuka_socket, timeout=5.0)
+            if ready and ready.strip() == "READY":
+                self.get_logger().info('KUKA connection established - received READY signal')
+            else:
+                self.get_logger().error(f'Unexpected response from KUKA: {ready}')
+                self.kuka_socket = None
             
         except Exception as e:
             self.get_logger().error(f'Failed to connect to KUKA: {e}')
             self.kuka_socket = None
     
-    def load_demos(self):
-        """Load demonstrations from file and flatten any 3D arrays into a list of 2D arrays."""
+    def _receive_complete_message(self, sock, timeout=5.0, buffer_size=8192):
+        """
+        Receive complete message from socket, handling multi-packet messages.
+        Assumes messages end with newline character.
+        """
         try:
-            self.demos = np.load(self.demo_file, allow_pickle=True)
+            sock.settimeout(timeout)
+            message_parts = []
+            
+            while True:
+                data = sock.recv(buffer_size)
+                if not data:
+                    break
+                
+                message_parts.append(data.decode('utf-8'))
+                
+                # Check if we received a complete line (ends with newline)
+                if b'\n' in data:
+                    break
+            
+            return ''.join(message_parts)
+        except socket.timeout:
+            self.get_logger().warn(f"Timeout waiting for response (>{timeout}s)")
+            return None
+        except Exception as e:
+            self.get_logger().error(f"Error receiving message: {e}")
+            return None
+    
+    def load_demos(self):
+        """Load demonstrations from file and flatten any 3D arrays into a list of 2D arrays.
+        
+        Handles formats from interactive_demo_recorder.py:
+        - Object array of lists (each demo is a list of [x,y,z,alpha,beta,gamma] lists)
+        - Each demo should be shape (N, 6) where N is number of poses
+        """
+        try:
+            loaded_data = np.load(self.demo_file, allow_pickle=True)
             demos_list = []
-            if isinstance(self.demos, np.ndarray) and self.demos.dtype == object:
-                for demo in self.demos:
+            
+            # Handle object arrays (from interactive_demo_recorder.py)
+            if isinstance(loaded_data, np.ndarray) and loaded_data.dtype == object:
+                for demo in loaded_data:
                     arr = np.array(demo)
-                    if arr.ndim == 3:
+                    if arr.ndim == 2 and arr.shape[1] == 6:
+                        # Valid demo: (N, 6) array
+                        demos_list.append(arr)
+                    elif arr.ndim == 1 and len(arr) == 6:
+                        # Single pose, wrap in array
+                        demos_list.append(arr.reshape(1, -1))
+                    elif arr.ndim == 3:
                         # Flatten 3D array into list of 2D arrays
                         for i in range(arr.shape[0]):
-                            demos_list.append(arr[i])
+                            if arr[i].shape[1] == 6:
+                                demos_list.append(arr[i])
                     else:
-                        demos_list.append(arr)
+                        self.get_logger().warn(f'Skipping demo with unexpected shape: {arr.shape}')
                 self.demos = demos_list
-            elif isinstance(self.demos, np.ndarray):
-                if self.demos.ndim == 3:
-                    for i in range(self.demos.shape[0]):
-                        demos_list.append(self.demos[i])
+            elif isinstance(loaded_data, np.ndarray):
+                if loaded_data.ndim == 3:
+                    # 3D array: (num_demos, num_points, 6)
+                    for i in range(loaded_data.shape[0]):
+                        demos_list.append(loaded_data[i])
                     self.demos = demos_list
+                elif loaded_data.ndim == 2:
+                    # Single demo: (num_points, 6)
+                    if loaded_data.shape[1] == 6:
+                        self.demos = [loaded_data]
+                    else:
+                        self.get_logger().error(f'Unexpected demo shape: {loaded_data.shape}')
+                        self.demos = []
                 else:
-                    self.demos = [self.demos]
+                    self.demos = [loaded_data]
+            elif isinstance(loaded_data, list):
+                # Already a list
+                self.demos = [np.array(demo) for demo in loaded_data if len(np.array(demo).shape) == 2]
+            else:
+                self.get_logger().error(f'Unexpected demo file format: {type(loaded_data)}')
+                self.demos = []
+            
             self.get_logger().info(f'Loaded {len(self.demos)} demonstrations from {self.demo_file}')
             # Debug: print shape of each demo
             for i, demo in enumerate(self.demos):
-                print(f"Demo {i} type: {type(demo)}, shape: {np.array(demo).shape}")
+                demo_arr = np.array(demo)
+                if demo_arr.ndim == 2 and demo_arr.shape[1] == 6:
+                    self.get_logger().info(f"Demo {i}: {demo_arr.shape[0]} poses, shape: {demo_arr.shape}")
+                else:
+                    self.get_logger().warn(f"Demo {i} has unexpected shape: {demo_arr.shape}")
+                    
         except FileNotFoundError:
             self.get_logger().error(f'Demo file not found: {self.demo_file}')
+            self.get_logger().info('Make sure you have recorded demos using interactive_demo_recorder.py first')
             self.demos = []
         except Exception as e:
             self.get_logger().error(f'Error loading demos: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             self.demos = []
     
     def normalize_demos(self):
@@ -203,31 +275,56 @@ class TrainAndExecute(Node):
             return False
         
         try:
-            # Format trajectory for KUKA
+            # Validate trajectory format
+            traj_array = np.array(self.learned_trajectory)
+            if traj_array.ndim != 2 or traj_array.shape[1] != 6:
+                self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
+                return False
+            
+            # Format trajectory for KUKA: x,y,z,alpha,beta,gamma separated by semicolons
+            # Format: "TRAJECTORY:x1,y1,z1,a1,b1,g1;x2,y2,z2,a2,b2,g2;..."
             trajectory_str = ";".join([
-                ",".join(map(str, point)) for point in self.learned_trajectory
+                ",".join([f"{val:.6f}" for val in point]) for point in self.learned_trajectory
             ])
             
-            command = f"TRAJECTORY:{trajectory_str}"
-            self.get_logger().info('Sending trajectory to KUKA...')
-            self.kuka_socket.sendall((command + "\n").encode('utf-8'))
+            command = f"TRAJECTORY:{trajectory_str}\n"
+            self.get_logger().info(f'Sending trajectory to KUKA ({len(self.learned_trajectory)} points)...')
+            self.kuka_socket.sendall(command.encode('utf-8'))
             
-            # Wait for completion
-            while True:
-                response = self.kuka_socket.recv(1024).decode('utf-8')
-                self.get_logger().info(f'KUKA response: {response}')
+            # Wait for completion - handle fragmented responses
+            complete = False
+            error = False
+            point_count = 0
+            
+            while not complete and not error:
+                response = self._receive_complete_message(self.kuka_socket, timeout=30.0)
+                if not response:
+                    self.get_logger().warn('No response from KUKA')
+                    break
+                
+                response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
                     self.get_logger().info('Trajectory executed successfully on KUKA')
+                    complete = True
                     return True
                 elif "ERROR" in response:
                     self.get_logger().error(f'KUKA execution error: {response}')
+                    error = True
                     return False
                 elif "POINT_COMPLETE" in response:
-                    self.get_logger().debug('Trajectory point completed')
+                    point_count += 1
+                    if point_count % 10 == 0:  # Log every 10 points
+                        self.get_logger().info(f'Progress: {point_count}/{len(self.learned_trajectory)} points completed')
+            
+            if not complete:
+                self.get_logger().warn('Trajectory execution did not complete normally')
+                return False
             
         except Exception as e:
             self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             return False
     
     def save_learned_trajectory(self, filename='learned_trajectory.npy'):
@@ -282,8 +379,8 @@ def main(args=None):
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train ProMP and execute trajectory')
-    parser.add_argument('--demo-file', default='demos.npy', help='Demo file path')
-    parser.add_argument('--kuka-ip', default='192.170.10.25', help='KUKA robot IP')
+    parser.add_argument('--demo-file', default='all_demos.npy', help='Demo file path (default: all_demos.npy from interactive_demo_recorder)')
+    parser.add_argument('--kuka-ip', default='172.31.1.147', help='KUKA robot IP (default: 172.31.1.147)')
     parser.add_argument('--train-only', action='store_true', help='Only train ProMP, do not execute')
     parser.add_argument('--execute-only', action='store_true', help='Only execute, do not train')
     parser.add_argument('--visualize', action='store_true', help='Show trajectory visualization')
