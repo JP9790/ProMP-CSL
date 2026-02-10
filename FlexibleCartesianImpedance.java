@@ -303,6 +303,11 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 // Validate pose data
                 if (pose.length < 6) {
                     getLogger().error("Pose data must have at least 6 values (x,y,z,alpha,beta,gamma), got: " + pose.length);
+                    synchronized (outputLock) {
+                        if (out != null) {
+                            out.println("ERROR:INVALID_POSE_POINT_" + i);
+                        }
+                    }
                     continue;
                 }
                 
@@ -317,61 +322,83 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 getLogger().info("Moving to Cartesian position: x=" + x + ", y=" + y + ", z=" + z + 
                                ", alpha=" + alpha + ", beta=" + beta + ", gamma=" + gamma);
                 
-                // Create Frame for Cartesian motion
-                Frame targetFrame = new Frame(x, y, z, alpha, beta, gamma);
-                
-                // Create CartesianImpedanceControlMode for compliant motion
-                // Note: CartesianImpedanceControlMode uses default constructor - impedance values
-                // are controlled through the robot's configuration or default behavior
-                // The robot will be compliant during motion, allowing physical interaction
-                CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
-                
-                // Cancel PositionHold before executing trajectory point
-                if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
-                    currentMotion.cancel();
-                }
-                
-                // Execute LIN motion with impedance control for compliance
-                // Robot remains compliant during motion for physical interaction
-                // With configured stiffness values, robot can be pushed/deformed during execution
-                currentMotion = robot.moveAsync(lin(targetFrame).setMode(currentImpedanceMode));
-                
-                // Monitor execution and allow external force deformation
-                while (!currentMotion.isFinished() && !stopRequested.get()) {
-                    try {
-                        // Check stop flag frequently during motion
-                        if (stopRequested.get()) {
-                            currentMotion.cancel();
+                // Try to execute this point - catch workspace errors and continue
+                try {
+                    // Create Frame for Cartesian motion
+                    Frame targetFrame = new Frame(x, y, z, alpha, beta, gamma);
+                    
+                    // Create CartesianImpedanceControlMode for compliant motion
+                    // Note: CartesianImpedanceControlMode uses default constructor - impedance values
+                    // are controlled through the robot's configuration or default behavior
+                    // The robot will be compliant during motion, allowing physical interaction
+                    CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
+                    
+                    // Cancel PositionHold before executing trajectory point
+                    if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
+                        currentMotion.cancel();
+                    }
+                    
+                    // Execute LIN motion with impedance control for compliance
+                    // Robot remains compliant during motion for physical interaction
+                    // With configured stiffness values, robot can be pushed/deformed during execution
+                    currentMotion = robot.moveAsync(lin(targetFrame).setMode(currentImpedanceMode));
+                    
+                    // Monitor execution and allow external force deformation
+                    while (!currentMotion.isFinished() && !stopRequested.get()) {
+                        try {
+                            // Check stop flag frequently during motion
+                            if (stopRequested.get()) {
+                                currentMotion.cancel();
+                                break;
+                            }
+                            
+                            // Monitor external forces for deformation detection
+                            // In impedance mode, the robot will naturally respond to external forces
+                            // Force data is sent continuously by background thread, no need to send here
+                            
+                            // Small delay to allow external force response and command processing
+                            Thread.sleep(50); // 20 Hz monitoring
+                            
+                        } catch (InterruptedException e) {
+                            getLogger().info("Motion monitoring interrupted");
+                            break;
+                        } catch (Exception e) {
+                            getLogger().error("Error during force monitoring: " + e.getMessage());
                             break;
                         }
-                        
-                        // Monitor external forces for deformation detection
-                        // In impedance mode, the robot will naturally respond to external forces
-                        // Force data is sent continuously by background thread, no need to send here
-                        
-                        // Small delay to allow external force response and command processing
-                        Thread.sleep(50); // 20 Hz monitoring
-                        
-                    } catch (InterruptedException e) {
-                        getLogger().info("Motion monitoring interrupted");
-                        break;
-                    } catch (Exception e) {
-                        getLogger().error("Error during force monitoring: " + e.getMessage());
+                    }
+                    
+                    // Check stop flag before moving to next point
+                    if (stopRequested.get()) {
+                        getLogger().info("Execution stopped before completing trajectory");
                         break;
                     }
-                }
-                
-                // Check stop flag before moving to next point
-                if (stopRequested.get()) {
-                    getLogger().info("Execution stopped before completing trajectory");
-                    break;
-                }
-                
-                // Thread-safe output
-                synchronized (outputLock) {
-                    if (out != null) {
-                        out.println("POINT_COMPLETE");
+                    
+                    // Thread-safe output - only send POINT_COMPLETE if motion completed successfully
+                    synchronized (outputLock) {
+                        if (out != null) {
+                            out.println("POINT_COMPLETE");
+                        }
                     }
+                    
+                } catch (Exception e) {
+                    // Catch workspace errors and other exceptions for this specific point
+                    String errorMsg = e.getMessage();
+                    getLogger().warn("Point " + i + " execution failed: " + errorMsg);
+                    
+                    // Send error message to Python so it can skip this point
+                    synchronized (outputLock) {
+                        if (out != null) {
+                            if (errorMsg != null && errorMsg.contains("Arbeitsraumfehler")) {
+                                out.println("ERROR:WORKSPACE_ERROR_POINT_" + i + ":" + errorMsg);
+                            } else {
+                                out.println("ERROR:POINT_" + i + ":" + errorMsg);
+                            }
+                        }
+                    }
+                    
+                    // Continue to next point instead of breaking
+                    continue;
                 }
             }
             
