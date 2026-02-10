@@ -273,10 +273,6 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             currentTrajectory = new ArrayList<double[]>(trajectory);
             currentTrajectoryIndex = 0;
             
-            // Setup Cartesian impedance control mode
-            // Parameters are loaded from data.xml configuration
-            CartesianImpedanceControlMode impedanceMode = new CartesianImpedanceControlMode();
-            
             // Read parameters with synchronization
             double sx, sy, sz, srot, damp;
             synchronized (this) {
@@ -291,6 +287,7 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().info("Stiffness: X=" + sx + ", Y=" + sy + ", Z=" + sz + 
                            ", RotX=" + srot + ", RotY=" + srot + ", RotZ=" + srot);
             getLogger().info("Damping: " + damp);
+            getLogger().info("Note: CartesianImpedanceControlMode uses default impedance values from robot configuration");
             
             // Execute trajectory with continuous impedance control for real-time deformation
             for (int i = 0; i < trajectory.size(); i++) {
@@ -323,25 +320,11 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 // Create Frame for Cartesian motion
                 Frame targetFrame = new Frame(x, y, z, alpha, beta, gamma);
                 
-                // Create impedance mode for this motion with configured parameters
-                // Read parameters with synchronization (may have been updated)
-                double sx, sy, sz, srot, damp;
-                synchronized (this) {
-                    sx = stiffnessX;
-                    sy = stiffnessY;
-                    sz = stiffnessZ;
-                    srot = stiffnessRot;
-                    damp = damping;
-                }
-                
-                // Create CartesianImpedanceControlMode with stiffness and damping parameters
-                // Constructor: CartesianImpedanceControlMode(stiffnessX, stiffnessY, stiffnessZ, 
-                //                                            stiffnessRotX, stiffnessRotY, stiffnessRotZ, damping)
-                CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode(
-                    sx, sy, sz,  // Translational stiffness (X, Y, Z)
-                    srot, srot, srot,  // Rotational stiffness (RotX, RotY, RotZ) - using same value for all
-                    damp  // Damping ratio
-                );
+                // Create CartesianImpedanceControlMode for compliant motion
+                // Note: CartesianImpedanceControlMode uses default constructor - impedance values
+                // are controlled through the robot's configuration or default behavior
+                // The robot will be compliant during motion, allowing physical interaction
+                CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
                 
                 // Cancel PositionHold before executing trajectory point
                 if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
