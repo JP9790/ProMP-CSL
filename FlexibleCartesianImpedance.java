@@ -334,16 +334,14 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     damp = damping;
                 }
                 
-                CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
-                // Set stiffness parameters for Cartesian impedance control
-                currentImpedanceMode.setStiffnessX(sx);
-                currentImpedanceMode.setStiffnessY(sy);
-                currentImpedanceMode.setStiffnessZ(sz);
-                currentImpedanceMode.setStiffnessRotX(srot);
-                currentImpedanceMode.setStiffnessRotY(srot);
-                currentImpedanceMode.setStiffnessRotZ(srot);
-                // Set damping parameter
-                currentImpedanceMode.setDamping(damp);
+                // Create CartesianImpedanceControlMode with stiffness and damping parameters
+                // Constructor: CartesianImpedanceControlMode(stiffnessX, stiffnessY, stiffnessZ, 
+                //                                            stiffnessRotX, stiffnessRotY, stiffnessRotZ, damping)
+                CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode(
+                    sx, sy, sz,  // Translational stiffness (X, Y, Z)
+                    srot, srot, srot,  // Rotational stiffness (RotX, RotY, RotZ) - using same value for all
+                    damp  // Damping ratio
+                );
                 
                 // Cancel PositionHold before executing trajectory point
                 if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
