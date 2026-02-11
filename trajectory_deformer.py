@@ -2,8 +2,6 @@
 
 import numpy as np
 import copy
-from scipy.integrate import trapz
-from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 
 class TrajectoryDeformer:
@@ -27,23 +25,70 @@ class TrajectoryDeformer:
         self.deformed_trajectory = None
         self.num_waypts = 0
         
-        # Deformation matrix H (smooth transition)
-        self.H = self._create_deformation_matrix()
+        # Deformation matrix D (minimum jerk) - computed from finite differencing matrix A
+        # D = (A^T A)^(-1) where A is the finite differencing matrix
+        self.D = None  # Will be computed when trajectory is set
         
         # Energy tracking
         self.deformation_energy = 0.0
         self.energy_history = []
         
-    def _create_deformation_matrix(self):
-        """Create smooth deformation matrix H"""
-        H = np.zeros((self.n, self.n))
-        for i in range(self.n):
-            # Smooth transition: start small, peak in middle, end small
-            if i < self.n // 2:
-                H[i, i] = (i + 1) / (self.n // 2)
-            else:
-                H[i, i] = (self.n - i) / (self.n // 2)
-        return H
+    def _create_finite_differencing_matrix(self, n):
+        """
+        Create finite differencing matrix A for minimum jerk trajectories.
+        
+        A is a (N+3) × N matrix where:
+        - For column j: A[j, j] = 1, A[j+1, j] = -3, A[j+2, j] = 3, A[j+3, j] = -1
+        - All other elements are 0
+        
+        This matrix represents third-order finite differences.
+        
+        Args:
+            n: Number of waypoints (N)
+            
+        Returns:
+            A: Finite differencing matrix of shape (n+3, n)
+        """
+        A = np.zeros((n + 3, n))
+        
+        # Fill the matrix according to the pattern: 1, -3, 3, -1
+        for j in range(n):
+            if j < n:
+                A[j, j] = 1.0
+            if j + 1 < n + 3:
+                A[j + 1, j] = -3.0
+            if j + 2 < n + 3:
+                A[j + 2, j] = 3.0
+            if j + 3 < n + 3:
+                A[j + 3, j] = -1.0
+        
+        return A
+    
+    def _compute_deformation_matrix_D(self, n):
+        """
+        Compute deformation matrix D = (A^T A)^(-1) for minimum jerk trajectories.
+        
+        Args:
+            n: Number of waypoints
+            
+        Returns:
+            D: Deformation matrix of shape (n, n)
+        """
+        # Create finite differencing matrix A
+        A = self._create_finite_differencing_matrix(n)
+        
+        # Compute D = (A^T A)^(-1)
+        ATA = np.dot(A.T, A)
+        
+        # Check if matrix is invertible
+        try:
+            D = np.linalg.inv(ATA)
+        except np.linalg.LinAlgError:
+            # If singular, use pseudo-inverse
+            print('Warning: ATA matrix is singular, using pseudo-inverse')
+            D = np.linalg.pinv(ATA)
+        
+        return D
     
     def set_trajectory(self, trajectory):
         """Set the trajectory to be deformed"""
@@ -54,6 +99,10 @@ class TrajectoryDeformer:
         self.deformed_trajectory = None
         self.deformation_energy = 0.0
         self.energy_history = []
+        
+        # Compute deformation matrix D for the deformation region size
+        # D will be recomputed if n_waypoints changes, but typically it's fixed
+        self.D = self._compute_deformation_matrix_D(self.n)
         
     def deform(self, u_h):
         """
@@ -79,10 +128,21 @@ class TrajectoryDeformer:
         if len(u_h) != 6:
             raise ValueError("Human input u_h must have 6 dimensions")
         
-        # Calculate deformation for each dimension
+        # Ensure D matrix is computed
+        if self.D is None:
+            self.D = self._compute_deformation_matrix_D(self.n)
+        
+        # Apply deformation formula: S*_d = S_d + μ * D * f_h(t_c)
+        # where μ = self.alpha, D is the minimum jerk matrix, f_h = u_h
+        # D is (n × n), f_h is (6,), result is (n × 6)
+        # For each dimension, compute: gamma[:, dim] = alpha * D * (f_h[dim] * ones(n))
+        # This applies the force f_h[dim] uniformly across the n waypoints, then transforms via D
         gamma = np.zeros((self.n, 6))
+        ones_vector = np.ones(self.n)  # Vector of ones for uniform force application
         for dim in range(6):
-            gamma[:, dim] = self.alpha * np.dot(self.H, u_h[dim])
+            # D is (n × n), f_h[dim] * ones(n) is (n,), so D * (f_h[dim] * ones(n)) gives (n,)
+            # Then multiply by alpha: gamma[:, dim] = alpha * D * (f_h[dim] * ones(n))
+            gamma[:, dim] = self.alpha * np.dot(self.D, u_h[dim] * ones_vector)
         
         # Apply deformation to the region
         waypts_deform[deform_waypt_idx : self.n + deform_waypt_idx, :] += gamma
@@ -119,8 +179,8 @@ class TrajectoryDeformer:
         time_steps = np.linspace(0, 1, len(original_region))
         
         for dim in range(6):
-            # Calculate area between original and deformed curves
-            area = trapz(
+            # Calculate area between original and deformed curves using numpy's trapz
+            area = np.trapz(
                 np.abs(deformed_region[:, dim] - original_region[:, dim]),
                 time_steps
             )
