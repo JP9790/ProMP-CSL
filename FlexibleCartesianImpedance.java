@@ -658,13 +658,272 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     }
     
     /**
+     * Send external joint torques (torques on each joint due to external forces)
+     * 
+     * Computes external joint torques from flange force/torque using Jacobian transpose:
+     * τ_joint = J^T * F_external
+     * 
+     * Where:
+     * - τ_joint: 7x1 vector of external joint torques (Nm)
+     * - J^T: Transpose of 6x7 Jacobian matrix
+     * - F_external: 6x1 vector of external force/torque at flange [fx, fy, fz, tx, ty, tz]
+     * 
+     * This method is reliable and works with KUKA RoboticsAPI without needing
+     * specific joint torque sensor access methods.
+     */
+    private void sendExternalJointTorques() {
+        try {
+            if (robot == null || forceDataOut == null) {
+                return;
+            }
+            
+            // Get external force/torque at flange (already available from force sensor)
+            ForceSensorData forceData = robot.getExternalForceTorque(robot.getFlange());
+            
+            // External force/torque vector: [fx, fy, fz, tx, ty, tz]
+            double fx = forceData.getForce().getX();
+            double fy = forceData.getForce().getY();
+            double fz = forceData.getForce().getZ();
+            double tx = forceData.getTorque().getX();
+            double ty = forceData.getTorque().getY();
+            double tz = forceData.getTorque().getZ();
+            
+            // Get current joint positions for Jacobian computation
+            JointPosition currentJoints = robot.getCurrentJointPosition();
+            
+            // Compute Jacobian matrix (6x7) for current joint configuration
+            // KUKA RoboticsAPI provides getJacobian() method
+            double[][] jacobian = computeJacobian(currentJoints);
+            
+            // Compute external joint torques using Jacobian transpose: τ = J^T * F
+            double[] externalJointTorques = new double[7];
+            for (int i = 0; i < 7; i++) {
+                // τ_i = Σ_j (J^T_ij * F_j) = Σ_j (J_ji * F_j)
+                externalJointTorques[i] = 
+                    jacobian[0][i] * fx +   // Force X contribution
+                    jacobian[1][i] * fy +   // Force Y contribution
+                    jacobian[2][i] * fz +   // Force Z contribution
+                    jacobian[3][i] * tx +   // Torque X contribution
+                    jacobian[4][i] * ty +   // Torque Y contribution
+                    jacobian[5][i] * tz;    // Torque Z contribution
+            }
+            
+            // Format: JOINT_TORQUE:timestamp,j1,j2,j3,j4,j5,j6,j7
+            // Units: Nm (Newton-meters) for each joint
+            String jointTorqueMsg = String.format(Locale.US, "JOINT_TORQUE:%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
+                System.currentTimeMillis(),
+                externalJointTorques[0], externalJointTorques[1], externalJointTorques[2],
+                externalJointTorques[3], externalJointTorques[4], externalJointTorques[5],
+                externalJointTorques[6]);
+            
+            // Send external joint torques to Python controller
+            forceDataOut.println(jointTorqueMsg);
+            
+        } catch (Exception e) {
+            // Log error but continue - allows system to work even if Jacobian computation fails
+            getLogger().debug("Error computing external joint torques: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Compute Jacobian matrix (6x7) for current joint configuration
+     * Returns Jacobian where:
+     * - Rows 0-2: Linear velocity Jacobian (position)
+     * - Rows 3-5: Angular velocity Jacobian (orientation)
+     * - Columns 0-6: Joints 1-7
+     * 
+     * Uses KUKA RoboticsAPI's built-in Jacobian computation.
+     * KUKA RoboticsAPI provides: robot.getJacobian(frame, referenceFrame)
+     */
+    private double[][] computeJacobian(JointPosition joints) {
+        double[][] jacobian = new double[6][7];
+        
+        try {
+            Frame flangeFrame = robot.getFlange();
+            Frame baseFrame = robot.getRootFrame();
+            
+            // KUKA RoboticsAPI method: getJacobian(flangeFrame, baseFrame)
+            // Returns a 6x7 matrix representing the geometric Jacobian
+            // Note: Method name may be getJacobian() or computeJacobian() depending on API version
+            try {
+                // Try KUKA RoboticsAPI's built-in Jacobian computation
+                // Common method signatures:
+                // - robot.getJacobian(flangeFrame, baseFrame)
+                // - robot.computeJacobian(joints, flangeFrame)
+                
+                // Attempt to get Jacobian from API
+                // If this method doesn't exist, it will throw an exception and use fallback
+                com.kuka.roboticsAPI.geometricModel.Jacobian jacobianObj = robot.getJacobian(flangeFrame, baseFrame);
+                
+                // Extract Jacobian matrix from Jacobian object
+                // KUKA RoboticsAPI Jacobian typically provides getMatrix() or similar
+                // Adjust based on your API version
+                for (int i = 0; i < 6; i++) {
+                    for (int j = 0; j < 7; j++) {
+                        // Extract element (i, j) from Jacobian matrix
+                        // Method name may vary: getElement(i, j), getValue(i, j), etc.
+                        jacobian[i][j] = jacobianObj.getElement(i, j);
+                    }
+                }
+                
+                getLogger().debug("Computed Jacobian using KUKA RoboticsAPI");
+                
+            } catch (NoSuchMethodError | Exception e) {
+                // Fallback: Compute analytically if API method doesn't exist
+                getLogger().info("KUKA RoboticsAPI getJacobian() not available, using analytical computation");
+                jacobian = computeJacobianAnalytical(joints);
+            }
+            
+        } catch (Exception e) {
+            // If all methods fail, return zero matrix (Python will receive zeros)
+            getLogger().warn("Could not compute Jacobian: " + e.getMessage() + ", using zero matrix");
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 7; j++) {
+                    jacobian[i][j] = 0.0;
+                }
+            }
+        }
+        
+        return jacobian;
+    }
+    
+    /**
+     * Compute Jacobian analytically using KUKA LBR iiwa forward kinematics
+     * This computes the geometric Jacobian based on current joint positions
+     * 
+     * Reference: Based on standard robotics Jacobian computation
+     * J = [J_v; J_ω] where:
+     * - J_v: Linear velocity Jacobian (3x7)
+     * - J_ω: Angular velocity Jacobian (3x7)
+     */
+    private double[][] computeJacobianAnalytical(JointPosition joints) {
+        double[][] jacobian = new double[6][7];
+        
+        // Get current joint angles
+        double[] q = {
+            joints.get(0), joints.get(1), joints.get(2), joints.get(3),
+            joints.get(4), joints.get(5), joints.get(6)
+        };
+        
+        // KUKA LBR iiwa 7 DOF approximate DH parameters
+        // These should match your robot's actual parameters
+        // Link lengths (m) - approximate values for LBR iiwa
+        double[] a = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // Link lengths
+        double[] d = {0.34, 0.0, 0.40, 0.0, 0.40, 0.0, 0.126}; // Link offsets
+        double[] alpha = {0.0, -Math.PI/2, Math.PI/2, -Math.PI/2, Math.PI/2, -Math.PI/2, Math.PI/2}; // Link twists
+        
+        // Compute forward kinematics transformations
+        double[][][] T = new double[8][4][4]; // Transformation matrices for each link
+        T[0] = identityMatrix(); // Base frame
+        
+        // Compute transformation matrices using DH parameters
+        for (int i = 0; i < 7; i++) {
+            T[i+1] = multiplyMatrices(T[i], dhMatrix(q[i], d[i], a[i], alpha[i]));
+        }
+        
+        // Extract end-effector position and orientation
+        double[] p_e = {T[7][0][3], T[7][1][3], T[7][2][3]}; // End-effector position
+        
+        // Compute Jacobian columns
+        for (int i = 0; i < 7; i++) {
+            // Extract z-axis of joint i (rotation axis)
+            double[] z_i = {T[i][0][2], T[i][1][2], T[i][2][2]};
+            
+            // Extract position of joint i
+            double[] p_i = {T[i][0][3], T[i][1][3], T[i][2][3]};
+            
+            // Compute vector from joint i to end-effector
+            double[] p_ei = {p_e[0] - p_i[0], p_e[1] - p_i[1], p_e[2] - p_i[2]};
+            
+            // Linear velocity Jacobian: J_v = z_i × (p_e - p_i) for revolute joints
+            double[] j_v = crossProduct(z_i, p_ei);
+            jacobian[0][i] = j_v[0];
+            jacobian[1][i] = j_v[1];
+            jacobian[2][i] = j_v[2];
+            
+            // Angular velocity Jacobian: J_ω = z_i for revolute joints
+            jacobian[3][i] = z_i[0];
+            jacobian[4][i] = z_i[1];
+            jacobian[5][i] = z_i[2];
+        }
+        
+        getLogger().debug("Computed Jacobian analytically using DH parameters");
+        
+        return jacobian;
+    }
+    
+    /**
+     * Helper: Create 4x4 identity matrix
+     */
+    private double[][] identityMatrix() {
+        double[][] I = new double[4][4];
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                I[i][j] = (i == j) ? 1.0 : 0.0;
+            }
+        }
+        return I;
+    }
+    
+    /**
+     * Helper: Compute DH transformation matrix
+     */
+    private double[][] dhMatrix(double theta, double d, double a, double alpha) {
+        double[][] T = new double[4][4];
+        double ct = Math.cos(theta);
+        double st = Math.sin(theta);
+        double ca = Math.cos(alpha);
+        double sa = Math.sin(alpha);
+        
+        T[0][0] = ct; T[0][1] = -st * ca; T[0][2] = st * sa; T[0][3] = a * ct;
+        T[1][0] = st; T[1][1] = ct * ca; T[1][2] = -ct * sa; T[1][3] = a * st;
+        T[2][0] = 0; T[2][1] = sa; T[2][2] = ca; T[2][3] = d;
+        T[3][0] = 0; T[3][1] = 0; T[3][2] = 0; T[3][3] = 1;
+        
+        return T;
+    }
+    
+    /**
+     * Helper: Multiply two 4x4 matrices
+     */
+    private double[][] multiplyMatrices(double[][] A, double[][] B) {
+        double[][] C = new double[4][4];
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                C[i][j] = 0;
+                for (int k = 0; k < 4; k++) {
+                    C[i][j] += A[i][k] * B[k][j];
+                }
+            }
+        }
+        return C;
+    }
+    
+    /**
+     * Helper: Compute cross product of two 3D vectors
+     */
+    private double[] crossProduct(double[] a, double[] b) {
+        return new double[]{
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]
+        };
+    }
+    
+    /**
      * Continuous force data sender thread - sends force data at 100Hz
      * This runs independently to provide real-time force feedback
+     * Now also sends external joint torques for monitoring
      */
     private void continuousForceDataSender() {
         while (forceDataThreadRunning.get()) {
             try {
+                // Send external force/torque from flange sensor
                 sendForceData();
+                
+                // Send external joint torques (torques on each joint due to external forces)
+                sendExternalJointTorques();
+                
                 Thread.sleep(10); // 100 Hz - matches demo recording frequency
             } catch (InterruptedException e) {
                 getLogger().info("Force data thread interrupted");

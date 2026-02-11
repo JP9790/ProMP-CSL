@@ -3,6 +3,15 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Float64, Bool
+from sensor_msgs.msg import JointState
+try:
+    # Try to import iiwa_msgs if available (ROS2 port of iiwa_stack)
+    from iiwa_msgs.msg import JointTorque
+    HAS_IIWA_MSGS = True
+except ImportError:
+    # Fallback to JointState if iiwa_msgs not available
+    HAS_IIWA_MSGS = False
+
 import numpy as np
 import socket
 import time
@@ -14,6 +23,7 @@ import os
 from .trajectory_deformer import TrajectoryDeformer
 from .promp import ProMP
 from .stepwise_em_learner import StepwiseEMLearner
+from .train_and_execute import TrainAndExecute
 
 class StandaloneDeformationController(Node):
     def __init__(self):
@@ -25,6 +35,9 @@ class StandaloneDeformationController(Node):
         self.declare_parameter('force_threshold', 10.0)
         self.declare_parameter('torque_threshold', 2.0)
         self.declare_parameter('energy_threshold', 0.5)
+        # Joint torque thresholds for ProMP conditioning
+        self.declare_parameter('joint_torque_threshold_small', 0.5)  # Small threshold to filter noise (Nm)
+        self.declare_parameter('joint_torque_threshold_big', 3.0)  # Big threshold for ProMP conditioning (Nm)
         self.declare_parameter('deformation_alpha', 0.1)
         self.declare_parameter('deformation_waypoints', 10)
         self.declare_parameter('promp_conditioning_sigma', 0.01)
@@ -34,18 +47,59 @@ class StandaloneDeformationController(Node):
         self.declare_parameter('promp_file', 'promp_model.npy')
         self.declare_parameter('auto_start', True)  # Auto-start execution on initialization
         
+        # Training parameters (from train_and_execute.py)
+        self.declare_parameter('num_basis_functions', 50)
+        self.declare_parameter('sigma_noise', 0.01)
+        self.declare_parameter('save_directory', '~/robot_demos')
+        self.declare_parameter('demo_file', '')  # Empty means use save_directory/all_demos.npy
+        self.declare_parameter('trajectory_points', 100)
+        self.declare_parameter('train_on_startup', True)  # Train ProMP on startup
+        self.declare_parameter('execute_after_training', True)  # Execute trajectory after training
+        
+        # ROS2 topic parameters for external joint torques (if using iiwa_stack)
+        # Default: Use TCP socket (Java sends JOINT_TORQUE: messages)
+        self.declare_parameter('external_joint_torque_topic', '/iiwa/jointExternalTorque')  # Only used if use_ros2_joint_torques=True
+        self.declare_parameter('use_ros2_joint_torques', False)  # Default: False (use TCP socket from Java application)
+        
         # Get parameters
         self.kuka_ip = self.get_parameter('kuka_ip').value
         self.kuka_port = self.get_parameter('kuka_port').value
         self.force_threshold = self.get_parameter('force_threshold').value
         self.torque_threshold = self.get_parameter('torque_threshold').value
         self.energy_threshold = self.get_parameter('energy_threshold').value
+        self.joint_torque_threshold_small = self.get_parameter('joint_torque_threshold_small').value
+        self.joint_torque_threshold_big = self.get_parameter('joint_torque_threshold_big').value
         self.deformation_alpha = self.get_parameter('deformation_alpha').value
         self.deformation_waypoints = self.get_parameter('deformation_waypoints').value
         self.promp_conditioning_sigma = self.get_parameter('promp_conditioning_sigma').value
         self.trajectory_file = self.get_parameter('trajectory_file').value
         self.promp_file = self.get_parameter('promp_file').value
         self.auto_start = self.get_parameter('auto_start').value
+        
+        # Training parameters
+        self.num_basis = self.get_parameter('num_basis_functions').value
+        self.sigma_noise = self.get_parameter('sigma_noise').value
+        self.save_directory = os.path.expanduser(self.get_parameter('save_directory').value)
+        demo_file_param = self.get_parameter('demo_file').value
+        self.trajectory_points = self.get_parameter('trajectory_points').value
+        self.train_on_startup = self.get_parameter('train_on_startup').value
+        self.execute_after_training = self.get_parameter('execute_after_training').value
+        
+        # ROS2 joint torque parameters
+        self.external_joint_torque_topic = self.get_parameter('external_joint_torque_topic').value
+        self.use_ros2_joint_torques = self.get_parameter('use_ros2_joint_torques').value
+        
+        # Set demo_file path (matching train_and_execute.py logic)
+        if demo_file_param:
+            if os.path.isabs(demo_file_param):
+                self.demo_file = demo_file_param
+            else:
+                if os.path.exists(demo_file_param):
+                    self.demo_file = demo_file_param
+                else:
+                    self.demo_file = os.path.join(self.save_directory, demo_file_param)
+        else:
+            self.demo_file = os.path.join(self.save_directory, 'all_demos.npy')
         
         # Components
         self.deformer = TrajectoryDeformer(
@@ -56,13 +110,27 @@ class StandaloneDeformationController(Node):
         self.promp = None
         self.current_trajectory = None
         self.current_joint_trajectory = None  # Joint space trajectory
+        self.demos = []  # Demonstrations for training
+        self.stepwise_em_learner = None  # Stepwise EM learner for incremental learning
+        
+        # Normalization statistics (for denormalizing generated trajectories)
+        self.demo_min = None
+        self.demo_max = None
+        self.demo_mean = None
+        self.demo_std = None
         
         # State
         self.is_executing = False
         self.is_monitoring = False
         self.execution_thread = None
         self.monitoring_thread = None
-        self.torque_data = deque(maxlen=1000)
+        self.torque_data = deque(maxlen=1000)  # External force/torque from sensor
+        self.joint_torque_data = deque(maxlen=1000)  # Joint torques for each joint (7 joints)
+        
+        # Execution progress tracking
+        self.trajectory_start_time = None  # Wall-clock time when trajectory started
+        self.trajectory_duration = None  # Estimated duration of trajectory (seconds)
+        self.current_trajectory_index = 0  # Current point index in trajectory
         
         # TCP communication
         self.kuka_socket = None
@@ -79,11 +147,24 @@ class StandaloneDeformationController(Node):
         # Setup publishers and subscribers
         self.setup_ros_communication()
         
-        # Load trajectory and ProMP
-        self.load_trajectory_and_promp()
+        # Step 1: Train ProMP from demonstrations (if enabled)
+        if self.train_on_startup:
+            self.get_logger().info('Training ProMP from demonstrations on startup...')
+            if self.train_and_generate_trajectory():
+                self.get_logger().info('ProMP training and trajectory generation completed')
+            else:
+                self.get_logger().warn('ProMP training failed, trying to load existing trajectory...')
+                self.load_trajectory_and_promp()
+        else:
+            # Load existing trajectory and ProMP
+            self.load_trajectory_and_promp()
         
-        # Auto-start execution if enabled and trajectory is loaded
-        if self.auto_start and self.current_trajectory is not None:
+        # Step 2: Execute trajectory (if enabled and trajectory is available)
+        if self.execute_after_training and self.current_trajectory is not None:
+            self.get_logger().info('Auto-execute enabled: Starting trajectory execution...')
+            # Give a small delay to ensure everything is initialized
+            threading.Timer(1.0, self.start_execution).start()
+        elif self.auto_start and self.current_trajectory is not None:
             self.get_logger().info('Auto-start enabled: Starting trajectory execution...')
             # Give a small delay to ensure everything is initialized
             threading.Timer(1.0, self.start_execution).start()
@@ -301,6 +382,217 @@ class StandaloneDeformationController(Node):
             Bool, 'stop_deformation_execution', self.stop_execution_callback, 10)
         self.load_trajectory_sub = self.create_subscription(
             String, 'load_trajectory', self.load_trajectory_callback, 10)
+        
+        # Subscribe to external joint torques from ROS2 topic (if iiwa_stack is available)
+        # Otherwise, joint torques will be received via TCP socket from Java application
+        if self.use_ros2_joint_torques:
+            if HAS_IIWA_MSGS:
+                # Use iiwa_msgs/JointTorque if available (matches iiwa_stack)
+                self.external_joint_torque_sub = self.create_subscription(
+                    JointTorque, self.external_joint_torque_topic, 
+                    self.external_joint_torque_callback, 10)
+                self.get_logger().info(f'Subscribed to external joint torques via ROS2 topic: {self.external_joint_torque_topic} (using iiwa_msgs/JointTorque)')
+            else:
+                # Fallback: Use sensor_msgs/JointState (standard ROS2 message)
+                # Topic might be /iiwa/joint_states or similar
+                self.external_joint_torque_sub = self.create_subscription(
+                    JointState, self.external_joint_torque_topic,
+                    self.external_joint_torque_callback_jointstate, 10)
+                self.get_logger().info(f'Subscribed to external joint torques via ROS2 topic: {self.external_joint_torque_topic} (using sensor_msgs/JointState)')
+                self.get_logger().info('Note: Ensure the topic publishes external joint torques in the effort field')
+        else:
+            self.get_logger().info('Using TCP socket for external joint torques (Java application will send JOINT_TORQUE: messages)')
+            self.get_logger().info('Java application must be configured to send external joint torques via TCP port 30003')
+    
+    def load_demos(self):
+        """Load demonstrations from file (matching train_and_execute.py)"""
+        try:
+            if not os.path.exists(self.demo_file):
+                self.get_logger().error(f'Demo file not found: {self.demo_file}')
+                self.get_logger().error('Please record demonstrations first using interactive_demo_recorder.py')
+                return False
+            
+            loaded_data = np.load(self.demo_file, allow_pickle=True)
+            demos_list = []
+            
+            # Handle object arrays (from interactive_demo_recorder.py)
+            if isinstance(loaded_data, np.ndarray) and loaded_data.dtype == object:
+                for demo in loaded_data:
+                    arr = np.array(demo)
+                    if arr.ndim == 2 and arr.shape[1] == 6:
+                        demos_list.append(arr)
+                    elif arr.ndim == 1 and len(arr) == 6:
+                        demos_list.append(arr.reshape(1, -1))
+                    elif arr.ndim == 3:
+                        for i in range(arr.shape[0]):
+                            if arr[i].shape[1] == 6:
+                                demos_list.append(arr[i])
+            elif isinstance(loaded_data, np.ndarray):
+                if loaded_data.ndim == 3:
+                    for i in range(loaded_data.shape[0]):
+                        demos_list.append(loaded_data[i])
+                elif loaded_data.ndim == 2 and loaded_data.shape[1] == 6:
+                    demos_list.append(loaded_data)
+            
+            self.demos = demos_list
+            self.get_logger().info(f'Loaded {len(self.demos)} demonstrations from {self.demo_file}')
+            return len(self.demos) > 0
+            
+        except Exception as e:
+            self.get_logger().error(f'Error loading demonstrations: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return False
+    
+    def normalize_demos(self):
+        """Normalize demonstrations to same length and compute statistics (matching train_and_execute.py)"""
+        if len(self.demos) == 0:
+            return []
+        
+        from scipy.interpolate import interp1d
+        
+        target_length = self.trajectory_points
+        normalized = []
+        all_values = []  # Collect all values for statistics
+        
+        # First, interpolate all demos to same length
+        for demo in self.demos:
+            demo_array = np.array(demo)
+            t_old = np.linspace(0, 1, len(demo_array))
+            t_new = np.linspace(0, 1, target_length)
+            
+            normalized_demo = []
+            for dim in range(6):  # 6 DOF: x, y, z, alpha, beta, gamma
+                try:
+                    interp_func = interp1d(t_old, demo_array[:, dim], kind='cubic', fill_value='extrapolate')
+                    normalized_demo.append(interp_func(t_new))
+                except ValueError:
+                    # Fallback to linear if cubic fails
+                    interp_func = interp1d(t_old, demo_array[:, dim], kind='linear', fill_value='extrapolate')
+                    normalized_demo.append(interp_func(t_new))
+            
+            normalized_demo_array = np.column_stack(normalized_demo)
+            normalized.append(normalized_demo_array)
+            all_values.append(normalized_demo_array)
+        
+        # Compute statistics across all demos for denormalization
+        all_values = np.concatenate(all_values, axis=0)  # Stack all demos
+        self.demo_min = np.min(all_values, axis=0)
+        self.demo_max = np.max(all_values, axis=0)
+        self.demo_mean = np.mean(all_values, axis=0)
+        self.demo_std = np.std(all_values, axis=0)
+        
+        # Avoid division by zero
+        self.demo_std = np.where(self.demo_std < 1e-10, 1.0, self.demo_std)
+        
+        self.get_logger().info(f'Demo statistics computed:')
+        self.get_logger().info(f'  Min: {self.demo_min}')
+        self.get_logger().info(f'  Max: {self.demo_max}')
+        self.get_logger().info(f'  Mean: {self.demo_mean}')
+        self.get_logger().info(f'  Std: {self.demo_std}')
+        
+        # Normalize values to [0, 1] range for ProMP training
+        normalized_scaled = []
+        for demo in normalized:
+            # Normalize: (value - min) / (max - min)
+            demo_normalized = (demo - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+            normalized_scaled.append(demo_normalized)
+        
+        return normalized_scaled
+    
+    def train_promp(self):
+        """Train ProMP on loaded demonstrations (matching train_and_execute.py)"""
+        if len(self.demos) < 1:
+            self.get_logger().error('No demonstrations available for training')
+            return False
+        
+        try:
+            self.get_logger().info('Normalizing demonstrations...')
+            normalized_demos = self.normalize_demos()
+            
+            self.get_logger().info('Training ProMP...')
+            self.promp = ProMP(num_basis=self.num_basis, sigma_noise=self.sigma_noise)
+            self.promp.train(normalized_demos)
+            
+            # Initialize StepwiseEMLearner with initial demos for incremental learning
+            self.get_logger().info('Initializing StepwiseEMLearner for incremental learning...')
+            self.stepwise_em_learner = StepwiseEMLearner(
+                num_basis=self.num_basis,
+                sigma_noise=self.sigma_noise,
+                delta_N=0.1  # Step size for incremental updates
+            )
+            
+            # Initialize with first demo, then update with remaining demos
+            if len(normalized_demos) > 0:
+                self.stepwise_em_learner.initialize_from_first_demo(normalized_demos[0])
+                self.get_logger().info(f'StepwiseEMLearner initialized with first demo')
+                
+                # Update with remaining demos incrementally
+                for i in range(1, len(normalized_demos)):
+                    self.stepwise_em_learner.stepwise_em_update(normalized_demos[i])
+                    self.get_logger().info(f'StepwiseEMLearner updated with demo {i+1}/{len(normalized_demos)}')
+            
+            # Sync ProMP parameters from StepwiseEMLearner (they should match after initialization)
+            if self.stepwise_em_learner.mean_weights is not None:
+                self.promp.mean_weights = self.stepwise_em_learner.mean_weights.copy()
+                self.promp.cov_weights = self.stepwise_em_learner.cov_weights.copy()
+                self.get_logger().info('ProMP parameters synced with StepwiseEMLearner')
+            
+            self.get_logger().info('ProMP training and StepwiseEMLearner initialization completed successfully')
+            return True
+            
+        except Exception as e:
+            self.get_logger().error(f'Error training ProMP: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return False
+    
+    def generate_trajectory(self):
+        """Generate trajectory from trained ProMP and denormalize (matching train_and_execute.py)"""
+        if self.promp is None:
+            self.get_logger().error('ProMP not trained yet')
+            return None
+        
+        try:
+            trajectory_normalized = self.promp.generate_trajectory(num_points=self.trajectory_points)
+            
+            # Denormalize trajectory back to original scale
+            if self.demo_min is not None and self.demo_max is not None:
+                trajectory_denorm = trajectory_normalized * (self.demo_max - self.demo_min) + self.demo_min
+                trajectory_denorm = np.clip(trajectory_denorm, self.demo_min, self.demo_max)
+                self.current_trajectory = trajectory_denorm
+            else:
+                self.current_trajectory = trajectory_normalized
+            
+            self.get_logger().info(f'Generated trajectory shape: {self.current_trajectory.shape}')
+            return self.current_trajectory
+            
+        except Exception as e:
+            self.get_logger().error(f'Error generating trajectory: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return None
+    
+    def train_and_generate_trajectory(self):
+        """Train ProMP and generate trajectory (complete training pipeline)"""
+        # Step 1: Load demonstrations
+        if not self.load_demos():
+            return False
+        
+        # Step 2: Train ProMP
+        if not self.train_promp():
+            return False
+        
+        # Step 3: Generate trajectory
+        trajectory = self.generate_trajectory()
+        if trajectory is None:
+            return False
+        
+        # Step 4: Set trajectory in deformer
+        self.deformer.set_trajectory(trajectory)
+        
+        self.get_logger().info('Training and trajectory generation completed successfully')
+        return True
     
     def load_trajectory_and_promp(self):
         """Load trajectory and ProMP from files
@@ -391,14 +683,92 @@ class StandaloneDeformationController(Node):
         except Exception as e:
             self.get_logger().error(f'Error loading trajectory: {e}')
     
+    def external_joint_torque_callback(self, msg):
+        """
+        Callback for external joint torques from ROS2 topic (using iiwa_msgs/JointTorque)
+        Similar to iiwa_stack's ExternalJointTorque class
+        
+        Expected message format (iiwa_msgs/JointTorque):
+        - torque: float64[7] - external joint torques for 7 joints (Nm)
+        - header: std_msgs/Header with timestamp
+        """
+        try:
+            # Extract joint torques from message
+            # iiwa_msgs/JointTorque typically has a 'torque' field with 7 values
+            if hasattr(msg, 'torque') and len(msg.torque) >= 7:
+                joint_torques = list(msg.torque[:7])  # Take first 7 values
+            elif hasattr(msg, 'data') and len(msg.data) >= 7:
+                joint_torques = list(msg.data[:7])
+            else:
+                self.get_logger().warn(f'Unexpected JointTorque message format: {type(msg)}')
+                return
+            
+            # Get timestamp
+            timestamp = time.time()
+            if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+                # Convert ROS2 time to seconds
+                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            elif hasattr(msg, 'timestamp'):
+                timestamp = msg.timestamp
+            
+            # Store external joint torques
+            self.joint_torque_data.append({
+                'timestamp': timestamp,
+                'joint_torques': joint_torques  # [tau1, tau2, ..., tau7] in Nm
+            })
+            
+        except Exception as e:
+            self.get_logger().error(f'Error processing external joint torque message: {e}')
+    
+    def external_joint_torque_callback_jointstate(self, msg):
+        """
+        Callback for external joint torques from ROS2 topic (using sensor_msgs/JointState)
+        Fallback when iiwa_msgs is not available
+        
+        Expected message format (sensor_msgs/JointState):
+        - name: string[] - joint names
+        - effort: float64[] - joint efforts (torques) - should contain external torques
+        - header: std_msgs/Header with timestamp
+        """
+        try:
+            # Extract joint torques from effort field
+            if not hasattr(msg, 'effort') or len(msg.effort) < 7:
+                self.get_logger().debug('JointState message does not have 7 joint efforts')
+                return
+            
+            joint_torques = list(msg.effort[:7])  # Take first 7 joint torques
+            
+            # Get timestamp
+            timestamp = time.time()
+            if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            
+            # Store external joint torques
+            self.joint_torque_data.append({
+                'timestamp': timestamp,
+                'joint_torques': joint_torques  # [tau1, tau2, ..., tau7] in Nm
+            })
+            
+            # Log periodically
+            if len(self.joint_torque_data) % 100 == 0:
+                self.get_logger().debug(f'Received external joint torques via ROS2: {joint_torques}')
+            
+        except Exception as e:
+            self.get_logger().error(f'Error processing JointState message: {e}')
+    
     def receive_torque_data(self):
-        """Receive torque data from KUKA robot"""
+        """Receive torque data from KUKA robot via TCP socket
+        Receives external force/torque (from sensor) at flange
+        
+        Note: If use_ros2_joint_torques=True, external joint torques are received via ROS2 topic
+        instead of TCP socket (cleaner approach, similar to iiwa_stack)
+        """
         try:
             conn, addr = self.torque_socket.accept()
             self.get_logger().info(f'Torque data connection from {addr}')
             
             while True:
-                data = conn.recv(1024)
+                data = conn.recv(2048)
                 if not data:
                     break
                     
@@ -406,13 +776,30 @@ class StandaloneDeformationController(Node):
                 for line in lines:
                     if line.strip():
                         try:
-                            timestamp, fx, fy, fz, tx, ty, tz = map(float, line.strip().split(','))
-                            self.torque_data.append({
-                                'timestamp': timestamp,
-                                'force': [fx, fy, fz],
-                                'torque': [tx, ty, tz]
-                            })
-                        except ValueError:
+                            parts = line.strip().split(',')
+                            
+                            # Only parse external force/torque from TCP (joint torques come from ROS2 if enabled)
+                            if not self.use_ros2_joint_torques and line.startswith('JOINT_TORQUE:'):
+                                # Parse joint torque data from TCP (fallback mode)
+                                joint_data = line.replace('JOINT_TORQUE:', '').strip()
+                                values = [float(x) for x in joint_data.split(',')]
+                                if len(values) >= 8:  # timestamp + 7 joints
+                                    timestamp = values[0]
+                                    joint_torques = values[1:8]  # 7 joint torques
+                                    self.joint_torque_data.append({
+                                        'timestamp': timestamp,
+                                        'joint_torques': joint_torques
+                                    })
+                            elif len(parts) >= 7:
+                                # Parse external force/torque data (format: timestamp,fx,fy,fz,tx,ty,tz)
+                                timestamp, fx, fy, fz, tx, ty, tz = map(float, parts[:7])
+                                self.torque_data.append({
+                                    'timestamp': timestamp,
+                                    'force': [fx, fy, fz],
+                                    'torque': [tx, ty, tz]
+                                })
+                        except ValueError as e:
+                            self.get_logger().debug(f'Error parsing torque data line: {line[:50]}... Error: {e}')
                             continue
                             
         except Exception as e:
@@ -462,6 +849,10 @@ class StandaloneDeformationController(Node):
         self.get_logger().info('Starting trajectory execution...')
         self.execution_status_pub.publish(String(data='EXECUTION_STARTED'))
         
+        # Track execution progress (shared between threads)
+        point_count_lock = threading.Lock()
+        point_count = [0]  # Use list to allow modification from nested function
+        
         # Send trajectory and start execution in a separate thread that monitors progress
         # but allows interruption for deformation
         trajectory_executing = threading.Event()
@@ -471,9 +862,9 @@ class StandaloneDeformationController(Node):
         def execute_trajectory_with_monitoring(traj):
             """Execute trajectory and monitor progress, can be interrupted"""
             try:
-                # Use the blocking method to ensure trajectory starts executing
-                # But we'll monitor in a way that allows interruption
-                success = self.send_trajectory_to_kuka_with_interrupt(traj, trajectory_executing)
+                # Use the method that tracks progress via point_count
+                success = self.send_trajectory_to_kuka_with_interrupt_and_progress(
+                    traj, trajectory_executing, point_count, point_count_lock)
                 if success:
                     self.get_logger().info('Initial trajectory execution completed')
                 else:
@@ -492,6 +883,8 @@ class StandaloneDeformationController(Node):
         # Step 2: Monitor torque during execution
         last_deformation_time = 0
         deformation_cooldown = 0.5  # Minimum time between deformations (seconds)
+        last_conditioning_time = 0
+        conditioning_cooldown = 0.3  # Minimum time between conditioning (seconds)
         
         while self.is_executing:
             # Check if trajectory is still executing
@@ -500,7 +893,81 @@ class StandaloneDeformationController(Node):
                 time.sleep(0.1)
                 continue
             
-            # Check for external torque/force during execution
+            # Monitor joint torques during execution and check thresholds
+            if len(self.joint_torque_data) > 0:
+                latest_joint_torques = self.joint_torque_data[-1]
+                joint_torques = latest_joint_torques['joint_torques']
+                max_joint_torque = max(abs(t) for t in joint_torques)
+                
+                # Log joint torques periodically (every 50 samples)
+                if len(self.joint_torque_data) % 50 == 0:
+                    self.get_logger().info(f'Joint torques: J1={joint_torques[0]:.2f}, J2={joint_torques[1]:.2f}, '
+                                          f'J3={joint_torques[2]:.2f}, J4={joint_torques[3]:.2f}, '
+                                          f'J5={joint_torques[4]:.2f}, J6={joint_torques[5]:.2f}, '
+                                          f'J7={joint_torques[6]:.2f} Nm (max={max_joint_torque:.2f} Nm)')
+                
+                # Check joint torque thresholds for ProMP conditioning
+                current_time = time.time()
+                if (max_joint_torque > self.joint_torque_threshold_small and 
+                    max_joint_torque < self.joint_torque_threshold_big and
+                    (current_time - last_conditioning_time) > conditioning_cooldown):
+                    
+                    # Small to medium torque: Trigger ProMP conditioning at current time t
+                    self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds small threshold '
+                                          f'({self.joint_torque_threshold_small:.3f} Nm) - triggering ProMP conditioning')
+                    
+                    # Get current execution progress
+                    with point_count_lock:
+                        current_idx = point_count[0]
+                    
+                    # Calculate current time t in trajectory (normalized 0-1)
+                    t_current = current_idx / max(num_points, 1)
+                    t_current = np.clip(t_current, 0.0, 1.0)
+                    
+                    # Get current robot pose for conditioning
+                    current_pose = self.get_current_robot_pose()
+                    if current_pose is not None:
+                        # Trigger ProMP conditioning at time t_current
+                        self.trigger_promp_conditioning_at_time(t_current, current_pose, trajectory, 
+                                                               trajectory_executing, execution_thread,
+                                                               execute_trajectory_with_monitoring, point_count, point_count_lock)
+                        last_conditioning_time = current_time
+                    else:
+                        self.get_logger().warn('Could not get current robot pose, skipping conditioning')
+                
+                elif max_joint_torque >= self.joint_torque_threshold_big:
+                    # Large torque: Trigger trajectory deformation and incremental learning
+                    current_time = time.time()
+                    if (current_time - last_conditioning_time) > conditioning_cooldown:
+                        self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds big threshold '
+                                              f'({self.joint_torque_threshold_big:.3f} Nm) - triggering trajectory deformation')
+                        
+                        # Get current execution progress to restart from this point
+                        with point_count_lock:
+                            current_idx = point_count[0]
+                        
+                        # Calculate current time t in trajectory (normalized 0-1)
+                        t_current = current_idx / max(num_points, 1)
+                        t_current = np.clip(t_current, 0.0, 1.0)
+                        
+                        # Get current force/torque for deformation
+                        if len(self.torque_data) > 0:
+                            latest_torque = self.torque_data[-1]
+                            human_input = np.array(latest_torque['force'] + latest_torque['torque'])
+                        else:
+                            # Fallback: use joint torques converted to Cartesian (approximate)
+                            # Sum joint torques as proxy for external force
+                            human_input = np.array([max_joint_torque, max_joint_torque, max_joint_torque, 0.0, 0.0, 0.0])
+                        
+                        # Trigger trajectory deformation and incremental learning
+                        # Pass current_idx and t_current to restart from this point
+                        self.handle_trajectory_deformation_and_incremental_learning(
+                            trajectory, human_input, trajectory_executing, execution_thread,
+                            execute_trajectory_with_monitoring, point_count, point_count_lock,
+                            current_idx, t_current)
+                        last_conditioning_time = current_time
+            
+            # Check for external torque/force during execution (legacy support)
             if len(self.torque_data) > 0:
                 latest = self.torque_data[-1]
                 max_force = max(abs(f) for f in latest['force'])
@@ -733,6 +1200,177 @@ class StandaloneDeformationController(Node):
         # You can implement additional logic here (e.g., stop execution, switch to manual mode, etc.)
         self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
     
+    def handle_trajectory_deformation_and_incremental_learning(self, current_trajectory, human_input,
+                                                               trajectory_executing, execution_thread,
+                                                               execute_func, point_count, point_count_lock,
+                                                               current_idx, t_current):
+        """
+        Handle trajectory deformation when big threshold is exceeded:
+        1. Deform current trajectory using trajectory_deformer
+        2. Treat deformed trajectory as new demonstration
+        3. Train incrementally using StepwiseEMLearner
+        4. Generate new trajectory from updated ProMP
+        5. Continue execution with new trajectory from the time point where force was applied
+        
+        Args:
+            current_trajectory: Current trajectory being executed
+            human_input: Human force/torque input [fx, fy, fz, tx, ty, tz]
+            trajectory_executing: Event flag for trajectory execution
+            execution_thread: Thread executing the trajectory
+            execute_func: Function to execute trajectory
+            point_count: List tracking current point index
+            point_count_lock: Lock for thread-safe access to point_count
+            current_idx: Current point index where force was applied
+            t_current: Current time in trajectory (normalized 0-1) where force was applied
+        """
+        try:
+            self.get_logger().info('Starting trajectory deformation and incremental learning...')
+            
+            # Step 1: Deform current trajectory
+            self.deformer.set_trajectory(current_trajectory)
+            deformed_traj, original_traj, deformation_energy = self.deformer.deform(human_input)
+            
+            if deformed_traj is None:
+                self.get_logger().error('Trajectory deformation failed')
+                return
+            
+            self.get_logger().info(f'Trajectory deformed successfully. Energy: {deformation_energy:.4f}')
+            self.deformation_status_pub.publish(String(data=f'DEFORMATION_COMPLETED:{deformation_energy:.4f}'))
+            
+            # Step 2: Normalize deformed trajectory to match demo format
+            # Deformed trajectory is already in the same format as demos (N x 6)
+            deformed_demo = np.array(deformed_traj)
+            
+            # Normalize deformed demo using same statistics as original demos
+            if self.demo_min is not None and self.demo_max is not None:
+                # Normalize: (value - min) / (max - min)
+                deformed_demo_normalized = (deformed_demo - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+                # Ensure same length as other demos
+                if len(deformed_demo_normalized) != self.trajectory_points:
+                    from scipy.interpolate import interp1d
+                    t_old = np.linspace(0, 1, len(deformed_demo_normalized))
+                    t_new = np.linspace(0, 1, self.trajectory_points)
+                    deformed_demo_normalized_resampled = []
+                    for dim in range(6):
+                        interp_func = interp1d(t_old, deformed_demo_normalized[:, dim], 
+                                             kind='cubic', fill_value='extrapolate')
+                        deformed_demo_normalized_resampled.append(interp_func(t_new))
+                    deformed_demo_normalized = np.column_stack(deformed_demo_normalized_resampled)
+            else:
+                self.get_logger().warn('Demo normalization statistics not available, using raw deformed trajectory')
+                deformed_demo_normalized = deformed_demo
+            
+            # Step 3: Add deformed trajectory as new demonstration
+            self.demos.append(deformed_demo)  # Store in original scale
+            demo_count = len(self.demos)
+            self.get_logger().info(f'Deformed trajectory added as demonstration #{demo_count}')
+            
+            # Step 4: Initialize StepwiseEMLearner if not already initialized
+            if self.stepwise_em_learner is None:
+                self.get_logger().info('Initializing StepwiseEMLearner...')
+                self.stepwise_em_learner = StepwiseEMLearner(
+                    num_basis=self.num_basis,
+                    sigma_noise=self.sigma_noise,
+                    delta_N=0.1
+                )
+                
+                # Initialize with first demo if available
+                if len(self.demos) > 0:
+                    # Normalize first demo
+                    if self.demo_min is not None:
+                        first_demo_normalized = (np.array(self.demos[0]) - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+                    else:
+                        first_demo_normalized = np.array(self.demos[0])
+                    self.stepwise_em_learner.initialize_from_first_demo(first_demo_normalized)
+                    self.get_logger().info('StepwiseEMLearner initialized with first demo')
+            
+            # Step 5: Update StepwiseEMLearner incrementally with deformed trajectory
+            self.get_logger().info('Updating ProMP incrementally with deformed trajectory using StepwiseEM...')
+            self.stepwise_em_learner.stepwise_em_update(deformed_demo_normalized)
+            
+            # Step 6: Update ProMP parameters from StepwiseEMLearner
+            if self.stepwise_em_learner.mean_weights is not None:
+                self.promp.mean_weights = self.stepwise_em_learner.mean_weights.copy()
+                self.promp.cov_weights = self.stepwise_em_learner.cov_weights.copy()
+                self.promp.basis_centers = self.stepwise_em_learner.basis_centers.copy()
+                self.promp.basis_width = self.stepwise_em_learner.basis_width
+                self.get_logger().info('ProMP parameters updated from StepwiseEMLearner')
+            
+            # Step 7: Generate new trajectory from updated ProMP
+            num_points = len(current_trajectory)
+            new_trajectory_normalized = self.promp.generate_trajectory(num_points=num_points)
+            
+            # Denormalize new trajectory
+            if self.demo_min is not None and self.demo_max is not None:
+                new_trajectory = new_trajectory_normalized * (self.demo_max - self.demo_min) + self.demo_min
+                new_trajectory = np.clip(new_trajectory, self.demo_min, self.demo_max)
+            else:
+                new_trajectory = new_trajectory_normalized
+            
+            self.get_logger().info(f'Generated new trajectory from updated ProMP (shape: {new_trajectory.shape})')
+            
+            # Step 8: Update current trajectory and deformer
+            self.current_trajectory = new_trajectory
+            self.deformer.set_trajectory(new_trajectory)
+            
+            # Step 9: Interrupt current execution and restart with new trajectory
+            trajectory_executing.clear()  # Signal to stop current trajectory
+            
+            # Send STOP to robot
+            try:
+                self.kuka_socket.sendall(b"STOP\n")
+                self.get_logger().info('Sent STOP to robot to apply new trajectory from incremental learning')
+                
+                # Wait for STOPPED response
+                self.kuka_socket.settimeout(2.0)
+                try:
+                    response = self._receive_complete_message(self.kuka_socket, timeout=2.0)
+                    if response and "STOPPED" in response:
+                        self.get_logger().info('Robot stopped successfully, restarting with new trajectory')
+                    else:
+                        self.get_logger().warn('Did not receive STOPPED confirmation, proceeding anyway')
+                except socket.timeout:
+                    self.get_logger().warn('Timeout waiting for STOPPED, proceeding with new trajectory')
+                finally:
+                    self.kuka_socket.settimeout(None)
+            except Exception as e:
+                self.get_logger().error(f'Error sending STOP: {e}')
+            
+            # Step 10: Extract trajectory segment from current time point onwards
+            # Calculate the index in the new trajectory corresponding to t_current
+            new_trajectory_start_idx = int(t_current * num_points)
+            new_trajectory_start_idx = np.clip(new_trajectory_start_idx, 0, num_points - 1)
+            
+            # Get the remaining trajectory from the current time point
+            trajectory_from_current = new_trajectory[new_trajectory_start_idx:]
+            
+            self.get_logger().info(f'Restarting execution from point {new_trajectory_start_idx}/{num_points} '
+                                  f'(t={t_current:.3f}) with {len(trajectory_from_current)} remaining points')
+            
+            # Restart trajectory execution with remaining trajectory from current point
+            execution_thread = threading.Thread(
+                target=execute_func,
+                args=(trajectory_from_current,)
+            )
+            execution_thread.daemon = True
+            execution_thread.start()
+            trajectory_executing.set()  # Reset flag
+            
+            # Set point count to the starting index (for tracking purposes)
+            # Note: The actual execution will start from index 0 of trajectory_from_current,
+            # but we track the absolute position in the full trajectory
+            with point_count_lock:
+                point_count[0] = new_trajectory_start_idx
+            
+            self.get_logger().info(f'Restarted trajectory execution from time point t={t_current:.3f} '
+                                  f'with new trajectory from incremental learning (demo #{demo_count})')
+            self.deformation_status_pub.publish(String(data=f'INCREMENTAL_LEARNING_COMPLETED:{demo_count}:t={t_current:.3f}'))
+            
+        except Exception as e:
+            self.get_logger().error(f'Error during trajectory deformation and incremental learning: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+    
     def send_trajectory_to_kuka(self, trajectory):
         """Send full trajectory to KUKA robot and wait for completion (blocking)
         Converts Cartesian to joint positions using pybullet IK to avoid workspace errors
@@ -798,6 +1436,88 @@ class StandaloneDeformationController(Node):
             if not complete:
                 self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors: {error_count}')
                 return point_count > 0  # Return True if some progress made
+            
+        except Exception as e:
+            self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+            return False
+    
+    def send_trajectory_to_kuka_with_interrupt_and_progress(self, trajectory, interrupt_event, 
+                                                           point_count, point_count_lock):
+        """Send trajectory to KUKA robot and monitor execution, can be interrupted
+        Also tracks execution progress via point_count"""
+        if self.kuka_socket is None:
+            self.get_logger().error('No connection to KUKA robot')
+            return False
+        
+        try:
+            # Validate trajectory format
+            traj_array = np.array(trajectory)
+            if traj_array.ndim != 2 or traj_array.shape[1] != 6:
+                self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
+                return False
+            
+            # Convert Cartesian to joint positions using pybullet IK
+            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
+            joint_trajectory = self.cartesian_to_joint_python(trajectory)
+            
+            if joint_trajectory is None or len(joint_trajectory) == 0:
+                self.get_logger().error('Failed to convert trajectory to joint positions')
+                return False
+            
+            # Store joint trajectory
+            self.current_joint_trajectory = joint_trajectory
+            
+            # Format joint trajectory for KUKA
+            trajectory_str = ";".join([
+                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
+            ])
+            
+            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
+            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
+            self.kuka_socket.sendall(command.encode('utf-8'))
+            
+            # Monitor execution progress, checking for interrupt and tracking point count
+            complete = False
+            error_count = 0
+            
+            with point_count_lock:
+                point_count[0] = 0  # Reset point count
+            
+            while not complete and interrupt_event.is_set():
+                # Use shorter timeout to check interrupt more frequently
+                response = self._receive_complete_message(self.kuka_socket, timeout=1.0)
+                if not response:
+                    # Timeout - check if we should continue
+                    if not interrupt_event.is_set():
+                        self.get_logger().info('Trajectory execution interrupted by conditioning request')
+                        return False
+                    continue
+                
+                response = response.strip()
+                
+                if "TRAJECTORY_COMPLETE" in response:
+                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count[0]}, Errors (skipped): {error_count}')
+                    complete = True
+                    return True
+                elif "ERROR" in response:
+                    error_count += 1
+                    self.get_logger().warn(f'Point execution error (skipping): {response}')
+                elif "POINT_COMPLETE" in response:
+                    with point_count_lock:
+                        point_count[0] += 1
+                    if point_count[0] % 10 == 0:
+                        self.get_logger().info(f'Progress: {point_count[0]}/{len(joint_trajectory)} points completed')
+            
+            if not complete and not interrupt_event.is_set():
+                self.get_logger().info('Trajectory execution interrupted')
+                return False
+            elif not complete:
+                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count[0]}, Errors: {error_count}')
+                return point_count[0] > 0
+            
+            return True
             
         except Exception as e:
             self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
