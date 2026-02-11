@@ -23,24 +23,18 @@ import os
 from .trajectory_deformer import TrajectoryDeformer
 from .promp import ProMP
 from .stepwise_em_learner import StepwiseEMLearner
-from .train_and_execute import TrainAndExecute
 
-class StandaloneDeformationController(Node):
+class ProMPIncController(Node):
     def __init__(self):
-        super().__init__('standalone_deformation_controller')
+        super().__init__('promp_inc_controller')
         
         # Parameters
         self.declare_parameter('kuka_ip', '172.31.1.147')  # Match train_and_execute.py
         self.declare_parameter('kuka_port', 30002)
-        self.declare_parameter('force_threshold', 10.0)
-        self.declare_parameter('torque_threshold', 2.0)
-        self.declare_parameter('energy_threshold', 0.5)
-        # Joint torque thresholds for ProMP conditioning
-        self.declare_parameter('joint_torque_threshold_small', 0.5)  # Small threshold to filter noise (Nm)
-        self.declare_parameter('joint_torque_threshold_big', 3.0)  # Big threshold for ProMP conditioning (Nm)
+        # Joint torque threshold for triggering deformation and incremental learning
+        self.declare_parameter('joint_torque_threshold', 0.5)  # Threshold to trigger deformation + incremental learning (Nm)
         self.declare_parameter('deformation_alpha', 0.1)
         self.declare_parameter('deformation_waypoints', 10)
-        self.declare_parameter('promp_conditioning_sigma', 0.01)
         # Default trajectory file location - check ~/robotexecute first (where train_and_execute.py saves it)
         default_trajectory = os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy')
         self.declare_parameter('trajectory_file', default_trajectory)
@@ -64,14 +58,9 @@ class StandaloneDeformationController(Node):
         # Get parameters
         self.kuka_ip = self.get_parameter('kuka_ip').value
         self.kuka_port = self.get_parameter('kuka_port').value
-        self.force_threshold = self.get_parameter('force_threshold').value
-        self.torque_threshold = self.get_parameter('torque_threshold').value
-        self.energy_threshold = self.get_parameter('energy_threshold').value
-        self.joint_torque_threshold_small = self.get_parameter('joint_torque_threshold_small').value
-        self.joint_torque_threshold_big = self.get_parameter('joint_torque_threshold_big').value
+        self.joint_torque_threshold = self.get_parameter('joint_torque_threshold').value
         self.deformation_alpha = self.get_parameter('deformation_alpha').value
         self.deformation_waypoints = self.get_parameter('deformation_waypoints').value
-        self.promp_conditioning_sigma = self.get_parameter('promp_conditioning_sigma').value
         self.trajectory_file = self.get_parameter('trajectory_file').value
         self.promp_file = self.get_parameter('promp_file').value
         self.auto_start = self.get_parameter('auto_start').value
@@ -105,7 +94,7 @@ class StandaloneDeformationController(Node):
         self.deformer = TrajectoryDeformer(
             alpha=self.deformation_alpha,
             n_waypoints=self.deformation_waypoints,
-            energy_threshold=self.energy_threshold
+            energy_threshold=0.5  # Not used for decision, but required for TrajectoryDeformer
         )
         self.promp = None
         self.current_trajectory = None
@@ -121,16 +110,9 @@ class StandaloneDeformationController(Node):
         
         # State
         self.is_executing = False
-        self.is_monitoring = False
         self.execution_thread = None
-        self.monitoring_thread = None
         self.torque_data = deque(maxlen=1000)  # External force/torque from sensor
         self.joint_torque_data = deque(maxlen=1000)  # Joint torques for each joint (7 joints)
-        
-        # Execution progress tracking
-        self.trajectory_start_time = None  # Wall-clock time when trajectory started
-        self.trajectory_duration = None  # Estimated duration of trajectory (seconds)
-        self.current_trajectory_index = 0  # Current point index in trajectory
         
         # TCP communication
         self.kuka_socket = None
@@ -138,8 +120,6 @@ class StandaloneDeformationController(Node):
         
         # Statistics
         self.deformation_count = 0
-        self.conditioning_count = 0
-        self.total_energy = 0.0
         
         # Setup communication
         self.setup_communication()
@@ -169,8 +149,8 @@ class StandaloneDeformationController(Node):
             # Give a small delay to ensure everything is initialized
             threading.Timer(1.0, self.start_execution).start()
         
-        self.get_logger().info('Standalone Deformation Controller initialized')
-        
+        self.get_logger().info('ProMP Incremental Learning Controller initialized')
+    
     def setup_communication(self):
         """Setup TCP communication with KUKA robot"""
         try:
@@ -378,39 +358,108 @@ class StandaloneDeformationController(Node):
         """Setup ROS2 publishers and subscribers"""
         # Publishers
         self.deformation_status_pub = self.create_publisher(String, 'deformation_status', 10)
-        self.energy_pub = self.create_publisher(Float64, 'deformation_energy', 10)
-        self.conditioning_status_pub = self.create_publisher(String, 'conditioning_status', 10)
         self.execution_status_pub = self.create_publisher(String, 'execution_status', 10)
-        self.statistics_pub = self.create_publisher(String, 'deformation_statistics', 10)
         
         # Subscribers
         self.start_execution_sub = self.create_subscription(
-            Bool, 'start_deformation_execution', self.start_execution_callback, 10)
+            Bool, 'start_execution', self.start_execution_callback, 10)
         self.stop_execution_sub = self.create_subscription(
-            Bool, 'stop_deformation_execution', self.stop_execution_callback, 10)
-        self.load_trajectory_sub = self.create_subscription(
-            String, 'load_trajectory', self.load_trajectory_callback, 10)
+            Bool, 'stop_execution', self.stop_execution_callback, 10)
         
         # Subscribe to external joint torques from ROS2 topic (if iiwa_stack is available)
-        # Otherwise, joint torques will be received via TCP socket from Java application
         if self.use_ros2_joint_torques:
             if HAS_IIWA_MSGS:
-                # Use iiwa_msgs/JointTorque if available (matches iiwa_stack)
                 self.external_joint_torque_sub = self.create_subscription(
                     JointTorque, self.external_joint_torque_topic, 
                     self.external_joint_torque_callback, 10)
                 self.get_logger().info(f'Subscribed to external joint torques via ROS2 topic: {self.external_joint_torque_topic} (using iiwa_msgs/JointTorque)')
             else:
-                # Fallback: Use sensor_msgs/JointState (standard ROS2 message)
-                # Topic might be /iiwa/joint_states or similar
                 self.external_joint_torque_sub = self.create_subscription(
                     JointState, self.external_joint_torque_topic,
                     self.external_joint_torque_callback_jointstate, 10)
                 self.get_logger().info(f'Subscribed to external joint torques via ROS2 topic: {self.external_joint_torque_topic} (using sensor_msgs/JointState)')
-                self.get_logger().info('Note: Ensure the topic publishes external joint torques in the effort field')
         else:
             self.get_logger().info('Using TCP socket for external joint torques (Java application will send JOINT_TORQUE: messages)')
-            self.get_logger().info('Java application must be configured to send external joint torques via TCP port 30003')
+    
+    def external_joint_torque_callback(self, msg):
+        """Callback for external joint torques from ROS2 topic (using iiwa_msgs/JointTorque)"""
+        try:
+            if hasattr(msg, 'torque') and len(msg.torque) >= 7:
+                joint_torques = list(msg.torque[:7])
+            elif hasattr(msg, 'data') and len(msg.data) >= 7:
+                joint_torques = list(msg.data[:7])
+            else:
+                return
+            
+            timestamp = time.time()
+            if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            
+            self.joint_torque_data.append({
+                'timestamp': timestamp,
+                'joint_torques': joint_torques
+            })
+        except Exception as e:
+            self.get_logger().error(f'Error processing external joint torque message: {e}')
+    
+    def external_joint_torque_callback_jointstate(self, msg):
+        """Callback for external joint torques from ROS2 topic (using sensor_msgs/JointState)"""
+        try:
+            if not hasattr(msg, 'effort') or len(msg.effort) < 7:
+                return
+            
+            joint_torques = list(msg.effort[:7])
+            timestamp = time.time()
+            if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
+                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            
+            self.joint_torque_data.append({
+                'timestamp': timestamp,
+                'joint_torques': joint_torques
+            })
+        except Exception as e:
+            self.get_logger().error(f'Error processing JointState message: {e}')
+    
+    def receive_torque_data(self):
+        """Receive torque data from KUKA robot via TCP socket"""
+        try:
+            conn, addr = self.torque_socket.accept()
+            self.get_logger().info(f'Torque data connection from {addr}')
+            
+            while True:
+                data = conn.recv(2048)
+                if not data:
+                    break
+                    
+                lines = data.decode('utf-8').split('\n')
+                for line in lines:
+                    if line.strip():
+                        try:
+                            if not self.use_ros2_joint_torques and line.startswith('JOINT_TORQUE:'):
+                                joint_data = line.replace('JOINT_TORQUE:', '').strip()
+                                values = [float(x) for x in joint_data.split(',')]
+                                if len(values) >= 8:  # timestamp + 7 joints
+                                    timestamp = values[0]
+                                    joint_torques = values[1:8]
+                                    self.joint_torque_data.append({
+                                        'timestamp': timestamp,
+                                        'joint_torques': joint_torques
+                                    })
+                            elif len(line.strip().split(',')) >= 7:
+                                # Parse external force/torque data (format: timestamp,fx,fy,fz,tx,ty,tz)
+                                parts = line.strip().split(',')
+                                timestamp, fx, fy, fz, tx, ty, tz = map(float, parts[:7])
+                                self.torque_data.append({
+                                    'timestamp': timestamp,
+                                    'force': [fx, fy, fz],
+                                    'torque': [tx, ty, tz]
+                                })
+                        except ValueError as e:
+                            self.get_logger().debug(f'Error parsing torque data line: {line[:50]}... Error: {e}')
+                            continue
+                            
+        except Exception as e:
+            self.get_logger().error(f'Error receiving torque data: {e}')
     
     def load_demos(self):
         """Load demonstrations from file (matching train_and_execute.py)"""
@@ -603,16 +652,15 @@ class StandaloneDeformationController(Node):
         return True
     
     def load_trajectory_and_promp(self):
-        """Load trajectory and ProMP from files
-        Checks multiple common locations for trajectory file"""
+        """Load trajectory and ProMP from files"""
         try:
             # Try to load trajectory - check multiple locations
             trajectory_loaded = False
             trajectory_paths = [
-                self.trajectory_file,  # User-specified or default
-                os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy'),  # train_and_execute.py default location
-                os.path.join(os.path.expanduser('~/newfoldername'), 'learned_trajectory.npy'),  # Alternative location
-                'learned_trajectory.npy',  # Current directory
+                self.trajectory_file,
+                os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy'),
+                os.path.join(os.path.expanduser('~/newfoldername'), 'learned_trajectory.npy'),
+                'learned_trajectory.npy',
             ]
             
             for traj_path in trajectory_paths:
@@ -629,17 +677,15 @@ class StandaloneDeformationController(Node):
             
             if not trajectory_loaded:
                 self.get_logger().error(f'Trajectory file not found!')
-                self.get_logger().error(f'Checked paths: {trajectory_paths}')
                 self.get_logger().error('Please run train_and_execute.py first to generate a trajectory, or specify --trajectory-file')
-                self.get_logger().error('Example: ros2 run kuka_promp_control standalone_deformation_controller --trajectory-file ~/robotexecute/learned_trajectory.npy')
                 self.current_trajectory = None
                 return
             
-            # Load ProMP (if available) - also check multiple locations
+            # Load ProMP (if available)
             promp_paths = [
-                self.promp_file,  # User-specified
+                self.promp_file,
                 os.path.join(os.path.expanduser('~/robotexecute'), 'promp_model.npy'),
-                'promp_model.npy',  # Current directory
+                'promp_model.npy',
             ]
             
             promp_loaded = False
@@ -661,7 +707,7 @@ class StandaloneDeformationController(Node):
             
             if not promp_loaded:
                 self.get_logger().warn(f'ProMP file not found in any of: {promp_paths}')
-                self.get_logger().info('ProMP is optional - deformation will use trajectory deformer instead')
+                self.get_logger().info('ProMP is required - please train first')
                 self.promp = None
                 
         except Exception as e:
@@ -681,158 +727,8 @@ class StandaloneDeformationController(Node):
         if msg.data:
             self.stop_execution()
     
-    def load_trajectory_callback(self, msg):
-        """Callback to load new trajectory"""
-        try:
-            trajectory = np.load(msg.data)
-            self.current_trajectory = trajectory
-            self.deformer.set_trajectory(trajectory)
-            self.get_logger().info(f'Loaded new trajectory from {msg.data}')
-        except Exception as e:
-            self.get_logger().error(f'Error loading trajectory: {e}')
-    
-    def external_joint_torque_callback(self, msg):
-        """
-        Callback for external joint torques from ROS2 topic (using iiwa_msgs/JointTorque)
-        Similar to iiwa_stack's ExternalJointTorque class
-        
-        Expected message format (iiwa_msgs/JointTorque):
-        - torque: float64[7] - external joint torques for 7 joints (Nm)
-        - header: std_msgs/Header with timestamp
-        """
-        try:
-            # Extract joint torques from message
-            # iiwa_msgs/JointTorque typically has a 'torque' field with 7 values
-            if hasattr(msg, 'torque') and len(msg.torque) >= 7:
-                joint_torques = list(msg.torque[:7])  # Take first 7 values
-            elif hasattr(msg, 'data') and len(msg.data) >= 7:
-                joint_torques = list(msg.data[:7])
-            else:
-                self.get_logger().warn(f'Unexpected JointTorque message format: {type(msg)}')
-                return
-            
-            # Get timestamp
-            timestamp = time.time()
-            if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
-                # Convert ROS2 time to seconds
-                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            elif hasattr(msg, 'timestamp'):
-                timestamp = msg.timestamp
-            
-            # Store external joint torques
-            self.joint_torque_data.append({
-                'timestamp': timestamp,
-                'joint_torques': joint_torques  # [tau1, tau2, ..., tau7] in Nm
-            })
-            
-        except Exception as e:
-            self.get_logger().error(f'Error processing external joint torque message: {e}')
-    
-    def external_joint_torque_callback_jointstate(self, msg):
-        """
-        Callback for external joint torques from ROS2 topic (using sensor_msgs/JointState)
-        Fallback when iiwa_msgs is not available
-        
-        Expected message format (sensor_msgs/JointState):
-        - name: string[] - joint names
-        - effort: float64[] - joint efforts (torques) - should contain external torques
-        - header: std_msgs/Header with timestamp
-        """
-        try:
-            # Extract joint torques from effort field
-            if not hasattr(msg, 'effort') or len(msg.effort) < 7:
-                self.get_logger().debug('JointState message does not have 7 joint efforts')
-                return
-            
-            joint_torques = list(msg.effort[:7])  # Take first 7 joint torques
-            
-            # Get timestamp
-            timestamp = time.time()
-            if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
-                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            
-            # Store external joint torques
-            self.joint_torque_data.append({
-                'timestamp': timestamp,
-                'joint_torques': joint_torques  # [tau1, tau2, ..., tau7] in Nm
-            })
-            
-            # Log periodically
-            if len(self.joint_torque_data) % 100 == 0:
-                self.get_logger().debug(f'Received external joint torques via ROS2: {joint_torques}')
-            
-        except Exception as e:
-            self.get_logger().error(f'Error processing JointState message: {e}')
-    
-    def receive_torque_data(self):
-        """Receive torque data from KUKA robot via TCP socket
-        Receives external force/torque (from sensor) at flange
-        
-        Note: If use_ros2_joint_torques=True, external joint torques are received via ROS2 topic
-        instead of TCP socket (cleaner approach, similar to iiwa_stack)
-        """
-        try:
-            conn, addr = self.torque_socket.accept()
-            self.get_logger().info(f'Torque data connection from {addr}')
-            
-            while True:
-                data = conn.recv(2048)
-                if not data:
-                    break
-                    
-                lines = data.decode('utf-8').split('\n')
-                for line in lines:
-                    if line.strip():
-                        try:
-                            parts = line.strip().split(',')
-                            
-                            # Only parse external force/torque from TCP (joint torques come from ROS2 if enabled)
-                            if not self.use_ros2_joint_torques and line.startswith('JOINT_TORQUE:'):
-                                # Parse joint torque data from TCP (fallback mode)
-                                joint_data = line.replace('JOINT_TORQUE:', '').strip()
-                                values = [float(x) for x in joint_data.split(',')]
-                                if len(values) >= 8:  # timestamp + 7 joints
-                                    timestamp = values[0]
-                                    joint_torques = values[1:8]  # 7 joint torques
-                                    self.joint_torque_data.append({
-                                        'timestamp': timestamp,
-                                        'joint_torques': joint_torques
-                                    })
-                            elif len(parts) >= 7:
-                                # Parse external force/torque data (format: timestamp,fx,fy,fz,tx,ty,tz)
-                                timestamp, fx, fy, fz, tx, ty, tz = map(float, parts[:7])
-                                self.torque_data.append({
-                                    'timestamp': timestamp,
-                                    'force': [fx, fy, fz],
-                                    'torque': [tx, ty, tz]
-                                })
-                        except ValueError as e:
-                            self.get_logger().debug(f'Error parsing torque data line: {line[:50]}... Error: {e}')
-                            continue
-                            
-        except Exception as e:
-            self.get_logger().error(f'Error receiving torque data: {e}')
-    
-    def detect_human_interaction(self):
-        """Detect human interaction from torque data"""
-        if len(self.torque_data) == 0:
-            return None
-        
-        # Get latest torque data
-        latest_data = self.torque_data[-1]
-        
-        force_magnitude = np.linalg.norm(latest_data['force'])
-        torque_magnitude = np.linalg.norm(latest_data['torque'])
-        
-        if force_magnitude > self.force_threshold or torque_magnitude > self.torque_threshold:
-            # Return human input vector (combine force and torque)
-            human_input = np.array(latest_data['force'] + latest_data['torque'])
-            return human_input
-        
-        return None
-    
     def start_execution(self):
-        """Start execution of the trajectory with real-time deformation"""
+        """Start execution of the trajectory with deformation and incremental learning"""
         if self.is_executing:
             self.get_logger().warn('Execution already in progress')
             return
@@ -843,17 +739,15 @@ class StandaloneDeformationController(Node):
         self.execution_thread = threading.Thread(target=self.execution_loop)
         self.execution_thread.daemon = True
         self.execution_thread.start()
-        self.get_logger().info('Started trajectory execution with deformation monitoring')
-
+        self.get_logger().info('Started trajectory execution with deformation and incremental learning monitoring')
+    
     def execution_loop(self):
-        """Main execution loop: execute trajectory first (like train_and_execute.py), 
-        then monitor torque during execution and trigger deformation when needed"""
+        """Main execution loop: execute trajectory and trigger deformation + incremental learning when torque threshold is exceeded"""
         trajectory = np.copy(self.current_trajectory)
         num_points = trajectory.shape[0]
         dt = 0.01  # 100 Hz monitoring rate
         
-        # Step 1: Execute the initial trajectory first (like train_and_execute.py)
-        # This ensures the robot actually starts moving
+        # Step 1: Execute the initial trajectory first
         self.get_logger().info('Starting trajectory execution...')
         self.execution_status_pub.publish(String(data='EXECUTION_STARTED'))
         
@@ -870,13 +764,12 @@ class StandaloneDeformationController(Node):
         def execute_trajectory_with_monitoring(traj):
             """Execute trajectory and monitor progress, can be interrupted"""
             try:
-                # Use the method that tracks progress via point_count
                 success = self.send_trajectory_to_kuka_with_interrupt_and_progress(
                     traj, trajectory_executing, point_count, point_count_lock)
                 if success:
-                    self.get_logger().info('Initial trajectory execution completed')
+                    self.get_logger().info('Trajectory execution completed')
                 else:
-                    self.get_logger().warn('Initial trajectory execution had errors')
+                    self.get_logger().warn('Trajectory execution had errors')
             except Exception as e:
                 self.get_logger().error(f'Error in trajectory execution: {e}')
             finally:
@@ -891,8 +784,6 @@ class StandaloneDeformationController(Node):
         # Step 2: Monitor torque during execution
         last_deformation_time = 0
         deformation_cooldown = 0.5  # Minimum time between deformations (seconds)
-        last_conditioning_time = 0
-        conditioning_cooldown = 0.3  # Minimum time between conditioning (seconds)
         
         while self.is_executing:
             # Check if trajectory is still executing
@@ -901,7 +792,7 @@ class StandaloneDeformationController(Node):
                 time.sleep(0.1)
                 continue
             
-            # Monitor joint torques during execution and check thresholds
+            # Monitor joint torques during execution
             if len(self.joint_torque_data) > 0:
                 latest_joint_torques = self.joint_torque_data[-1]
                 joint_torques = latest_joint_torques['joint_torques']
@@ -914,17 +805,17 @@ class StandaloneDeformationController(Node):
                                           f'J5={joint_torques[4]:.2f}, J6={joint_torques[5]:.2f}, '
                                           f'J7={joint_torques[6]:.2f} Nm (max={max_joint_torque:.2f} Nm)')
                 
-                # Check joint torque thresholds for ProMP conditioning
+                # Check joint torque threshold - ALWAYS trigger deformation + incremental learning
+                # regardless of torque magnitude (as long as it exceeds threshold)
                 current_time = time.time()
-                if (max_joint_torque > self.joint_torque_threshold_small and 
-                    max_joint_torque < self.joint_torque_threshold_big and
-                    (current_time - last_conditioning_time) > conditioning_cooldown):
+                if (max_joint_torque > self.joint_torque_threshold and
+                    (current_time - last_deformation_time) > deformation_cooldown):
                     
-                    # Small to medium torque: Trigger ProMP conditioning at current time t
-                    self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds small threshold '
-                                          f'({self.joint_torque_threshold_small:.3f} Nm) - triggering ProMP conditioning')
+                    # Trigger trajectory deformation and incremental learning
+                    self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds threshold '
+                                          f'({self.joint_torque_threshold:.3f} Nm) - triggering deformation and incremental learning')
                     
-                    # Get current execution progress
+                    # Get current execution progress to restart from this point
                     with point_count_lock:
                         current_idx = point_count[0]
                     
@@ -932,166 +823,21 @@ class StandaloneDeformationController(Node):
                     t_current = current_idx / max(num_points, 1)
                     t_current = np.clip(t_current, 0.0, 1.0)
                     
-                    # Get current robot pose for conditioning
-                    current_pose = self.get_current_robot_pose()
-                    if current_pose is not None:
-                        # Trigger ProMP conditioning at time t_current
-                        self.trigger_promp_conditioning_at_time(t_current, current_pose, trajectory, 
-                                                               trajectory_executing, execution_thread,
-                                                               execute_trajectory_with_monitoring, point_count, point_count_lock)
-                        last_conditioning_time = current_time
+                    # Get current force/torque for deformation
+                    if len(self.torque_data) > 0:
+                        latest_torque = self.torque_data[-1]
+                        human_input = np.array(latest_torque['force'] + latest_torque['torque'])
                     else:
-                        self.get_logger().warn('Could not get current robot pose, skipping conditioning')
-                
-                elif max_joint_torque >= self.joint_torque_threshold_big:
-                    # Large torque: Trigger trajectory deformation and incremental learning
-                    current_time = time.time()
-                    if (current_time - last_conditioning_time) > conditioning_cooldown:
-                        self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds big threshold '
-                                              f'({self.joint_torque_threshold_big:.3f} Nm) - triggering trajectory deformation')
-                        
-                        # Get current execution progress to restart from this point
-                        with point_count_lock:
-                            current_idx = point_count[0]
-                        
-                        # Calculate current time t in trajectory (normalized 0-1)
-                        t_current = current_idx / max(num_points, 1)
-                        t_current = np.clip(t_current, 0.0, 1.0)
-                        
-                        # Get current force/torque for deformation
-                        if len(self.torque_data) > 0:
-                            latest_torque = self.torque_data[-1]
-                            human_input = np.array(latest_torque['force'] + latest_torque['torque'])
-                        else:
-                            # Fallback: use joint torques converted to Cartesian (approximate)
-                            # Sum joint torques as proxy for external force
-                            human_input = np.array([max_joint_torque, max_joint_torque, max_joint_torque, 0.0, 0.0, 0.0])
-                        
-                        # Trigger trajectory deformation and incremental learning
-                        # Pass current_idx and t_current to restart from this point
-                        self.handle_trajectory_deformation_and_incremental_learning(
-                            trajectory, human_input, trajectory_executing, execution_thread,
-                            execute_trajectory_with_monitoring, point_count, point_count_lock,
-                            current_idx, t_current)
-                        last_conditioning_time = current_time
-            
-            # Check for external torque/force during execution (legacy support)
-            if len(self.torque_data) > 0:
-                latest = self.torque_data[-1]
-                max_force = max(abs(f) for f in latest['force'])
-                max_torque = max(abs(t) for t in latest['torque'])
-                
-                # Check if force/torque exceeds threshold and cooldown has passed
-                current_time = time.time()
-                if (max_force > self.force_threshold or max_torque > self.torque_threshold) and \
-                   (current_time - last_deformation_time) > deformation_cooldown:
+                        # Fallback: use joint torques converted to Cartesian (approximate)
+                        # Sum joint torques as proxy for external force
+                        human_input = np.array([max_joint_torque, max_joint_torque, max_joint_torque, 0.0, 0.0, 0.0])
                     
-                    # Compute deformation energy
-                    energy = np.linalg.norm(latest['force']) + np.linalg.norm(latest['torque'])
-                    self.get_logger().info(f'Deformation detected! Energy: {energy:.4f}, Force: {max_force:.2f}N, Torque: {max_torque:.2f}Nm')
-                    self.deformation_status_pub.publish(String(data='DEFORMATION_DETECTED'))
-                    
-                    # Interrupt current trajectory execution
-                    trajectory_executing.clear()  # Signal to stop monitoring current trajectory
-                    
-                    # Send STOP to robot
-                    try:
-                        self.kuka_socket.sendall(b"STOP\n")
-                        self.get_logger().info('Sent STOP to robot to interrupt current trajectory')
-                        
-                        # Wait for STOPPED response with timeout
-                        self.kuka_socket.settimeout(2.0)
-                        try:
-                            response = self._receive_complete_message(self.kuka_socket, timeout=2.0)
-                            if response and "STOPPED" in response:
-                                self.get_logger().info('Robot stopped successfully')
-                            else:
-                                self.get_logger().warn('Did not receive STOPPED confirmation, proceeding anyway')
-                        except socket.timeout:
-                            self.get_logger().warn('Timeout waiting for STOPPED, proceeding with new trajectory')
-                        finally:
-                            self.kuka_socket.settimeout(None)
-                    except Exception as e:
-                        self.get_logger().error(f'Error sending STOP: {e}')
-                    
-                    # Get current robot position for conditioning
-                    try:
-                        self.kuka_socket.sendall(b"GET_POSE\n")
-                        self.kuka_socket.settimeout(1.0)
-                        pose_response = self._receive_complete_message(self.kuka_socket, timeout=1.0)
-                        self.kuka_socket.settimeout(None)
-                        
-                        if pose_response and pose_response.startswith("POSE:"):
-                            pose_str = pose_response.split("POSE:")[1].strip()
-                            current_pose = np.array([float(x) for x in pose_str.split(",")])
-                            t_condition = 0.5  # Use current time in trajectory (normalized)
-                            y_condition = current_pose
-                            self.get_logger().info(f'Got current pose for conditioning: {current_pose}')
-                        else:
-                            # Fallback: use mid-trajectory point
-                            t_condition = 0.5
-                            y_condition = trajectory[int(num_points * t_condition)]
-                            self.get_logger().warn('Could not get current pose, using mid-trajectory point')
-                    except Exception as e:
-                        self.get_logger().warn(f'Could not get current pose: {e}, using mid-trajectory point')
-                        t_condition = 0.5
-                        y_condition = trajectory[int(num_points * t_condition)]
-                    
-                    # Generate new trajectory based on deformation energy
-                    try:
-                        new_traj = None
-                        if self.promp is not None:
-                            if energy < self.energy_threshold:
-                                # Low energy: use ProMP conditioning
-                                self.get_logger().info(f'Energy {energy:.4f} < threshold {self.energy_threshold} - Triggering ProMP conditioning')
-                                self.promp.condition_on_waypoint(t_condition, y_condition)
-                                new_traj = self.promp.generate_trajectory(num_points=num_points)
-                                self.conditioning_count += 1
-                                self.conditioning_status_pub.publish(String(data='CONDITIONING_COMPLETED'))
-                            else:
-                                # High energy: use stepwise EM update
-                                self.get_logger().info(f'Energy {energy:.4f} >= threshold {self.energy_threshold} - Triggering stepwise EM update')
-                                em_learner = StepwiseEMLearner(self.promp)
-                                new_traj = em_learner.update_and_generate(trajectory, latest)
-                                self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
-                        else:
-                            # No ProMP available - use trajectory deformer
-                            self.get_logger().info('Using trajectory deformer (no ProMP available)')
-                            human_input = np.array(latest['force'] + latest['torque'])
-                            deformed_traj, _, _ = self.deformer.deform(human_input)
-                            if deformed_traj is not None:
-                                new_traj = deformed_traj
-                            else:
-                                self.get_logger().warn('Deformation failed, keeping current trajectory')
-                                new_traj = trajectory
-                        
-                        if new_traj is not None:
-                            # Update trajectory and send to robot
-                            trajectory = new_traj
-                            self.current_trajectory = new_traj
-                            self.deformer.set_trajectory(new_traj)
-                            
-                            # Restart trajectory execution with new trajectory
-                            trajectory_executing.set()  # Reset flag
-                            execution_thread = threading.Thread(
-                                target=execute_trajectory_with_monitoring, 
-                                args=(new_traj,)
-                            )
-                            execution_thread.daemon = True
-                            execution_thread.start()
-                            self.get_logger().info('Sent new trajectory to robot after deformation')
-                            
-                            last_deformation_time = current_time
-                            self.deformation_count += 1
-                            self.total_energy += energy
-                            self.energy_pub.publish(Float64(data=energy))
-                        else:
-                            self.get_logger().error('Failed to generate new trajectory')
-                        
-                    except Exception as e:
-                        self.get_logger().error(f'Error generating new trajectory: {e}')
-                        import traceback
-                        self.get_logger().error(traceback.format_exc())
+                    # Trigger trajectory deformation and incremental learning
+                    self.handle_trajectory_deformation_and_incremental_learning(
+                        trajectory, human_input, trajectory_executing, execution_thread,
+                        execute_trajectory_with_monitoring, point_count, point_count_lock,
+                        current_idx, t_current)
+                    last_deformation_time = current_time
             
             time.sleep(dt)
         
@@ -1106,7 +852,6 @@ class StandaloneDeformationController(Node):
     def stop_execution(self):
         """Stop trajectory execution"""
         self.is_executing = False
-        self.is_monitoring = False
         
         if self.kuka_socket:
             try:
@@ -1116,104 +861,13 @@ class StandaloneDeformationController(Node):
         
         self.get_logger().info('Stopped trajectory execution')
         self.execution_status_pub.publish(String(data='EXECUTION_STOPPED'))
-        
-        # Publish final statistics
-        self.publish_statistics()
-    
-    def monitoring_loop(self):
-        """Deformation monitoring loop"""
-        try:
-            while self.is_monitoring:
-                # Check for human interaction
-                human_input = self.detect_human_interaction()
-                
-                if human_input is not None:
-                    self.get_logger().info('Human interaction detected - applying deformation')
-                    self.deformation_status_pub.publish(String(data='DEFORMATION_DETECTED'))
-                    
-                    # Apply deformation
-                    deformed_traj, original_traj, energy = self.deformer.deform(human_input)
-                    
-                    if deformed_traj is not None:
-                        self.deformation_count += 1
-                        self.total_energy += energy
-                        
-                        # Publish energy
-                        self.energy_pub.publish(Float64(data=energy))
-                        
-                        # Check energy threshold
-                        if self.deformer.should_condition_promp():
-                            self.get_logger().info(f'Energy {energy:.4f} < threshold - triggering ProMP conditioning')
-                            self.trigger_promp_conditioning(deformed_traj)
-                        else:
-                            self.get_logger().info(f'Energy {energy:.4f} >= threshold - high deformation detected')
-                            self.handle_high_deformation(deformed_traj, energy)
-                
-                time.sleep(0.01)  # 100 Hz monitoring
-                
-        except Exception as e:
-            self.get_logger().error(f'Error in monitoring loop: {e}')
-        finally:
-            self.is_monitoring = False
-    
-    def trigger_promp_conditioning(self, deformed_trajectory):
-        """Trigger ProMP conditioning based on deformation"""
-        if self.promp is None:
-            self.get_logger().warn('No ProMP available for conditioning')
-            return
-        
-        try:
-            # Get deformation region
-            deform_region = self.deformer.get_deformation_region()
-            
-            # Create waypoints for conditioning
-            t_conditions = []
-            y_conditions = []
-            
-            for i, idx in enumerate(deform_region):
-                # Normalize time to 0-1
-                t_condition = idx / len(self.current_trajectory)
-                y_condition = deformed_trajectory[idx]
-                
-                t_conditions.append(t_condition)
-                y_conditions.append(y_condition)
-            
-            # Condition ProMP
-            self.promp.condition_on_multiple_waypoints(
-                t_conditions, y_conditions, self.promp_conditioning_sigma
-            )
-            
-            # Generate new trajectory
-            new_trajectory = self.promp.generate_trajectory(len(self.current_trajectory))
-            
-            # Update current trajectory
-            self.current_trajectory = new_trajectory
-            self.deformer.set_trajectory(new_trajectory)
-            
-            # Send updated trajectory to KUKA
-            self.send_trajectory_to_kuka(new_trajectory)
-            
-            self.conditioning_count += 1
-            self.get_logger().info('ProMP conditioning completed and new trajectory sent')
-            self.conditioning_status_pub.publish(String(data='CONDITIONING_COMPLETED'))
-            
-        except Exception as e:
-            self.get_logger().error(f'Error during ProMP conditioning: {e}')
-    
-    def handle_high_deformation(self, deformed_trajectory, energy):
-        """Handle high deformation energy scenarios"""
-        self.get_logger().warn(f'High deformation energy detected: {energy:.4f}')
-        
-        # For now, just log the high deformation
-        # You can implement additional logic here (e.g., stop execution, switch to manual mode, etc.)
-        self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
     
     def handle_trajectory_deformation_and_incremental_learning(self, current_trajectory, human_input,
                                                                trajectory_executing, execution_thread,
                                                                execute_func, point_count, point_count_lock,
                                                                current_idx, t_current):
         """
-        Handle trajectory deformation when big threshold is exceeded:
+        Handle trajectory deformation and incremental learning:
         1. Deform current trajectory using trajectory_deformer
         2. Treat deformed trajectory as new demonstration
         3. Train incrementally using StepwiseEMLearner
@@ -1246,7 +900,6 @@ class StandaloneDeformationController(Node):
             self.deformation_status_pub.publish(String(data=f'DEFORMATION_COMPLETED:{deformation_energy:.4f}'))
             
             # Step 2: Normalize deformed trajectory to match demo format
-            # Deformed trajectory is already in the same format as demos (N x 6)
             deformed_demo = np.array(deformed_traj)
             
             # Normalize deformed demo using same statistics as original demos
@@ -1345,7 +998,6 @@ class StandaloneDeformationController(Node):
                 self.get_logger().error(f'Error sending STOP: {e}')
             
             # Step 10: Extract trajectory segment from current time point onwards
-            # Calculate the index in the new trajectory corresponding to t_current
             new_trajectory_start_idx = int(t_current * num_points)
             new_trajectory_start_idx = np.clip(new_trajectory_start_idx, 0, num_points - 1)
             
@@ -1365,8 +1017,6 @@ class StandaloneDeformationController(Node):
             trajectory_executing.set()  # Reset flag
             
             # Set point count to the starting index (for tracking purposes)
-            # Note: The actual execution will start from index 0 of trajectory_from_current,
-            # but we track the absolute position in the full trajectory
             with point_count_lock:
                 point_count[0] = new_trajectory_start_idx
             
@@ -1378,78 +1028,6 @@ class StandaloneDeformationController(Node):
             self.get_logger().error(f'Error during trajectory deformation and incremental learning: {e}')
             import traceback
             self.get_logger().error(traceback.format_exc())
-    
-    def send_trajectory_to_kuka(self, trajectory):
-        """Send full trajectory to KUKA robot and wait for completion (blocking)
-        Converts Cartesian to joint positions using pybullet IK to avoid workspace errors
-        Matches train_and_execute.py implementation"""
-        if self.kuka_socket is None:
-            self.get_logger().error('No connection to KUKA robot')
-            return False
-        
-        try:
-            # Validate trajectory format
-            traj_array = np.array(trajectory)
-            if traj_array.ndim != 2 or traj_array.shape[1] != 6:
-                self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
-                return False
-            
-            # Convert Cartesian to joint positions using pybullet IK (matches train_and_execute.py)
-            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
-            joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
-            
-            if joint_trajectory is None or len(joint_trajectory) == 0:
-                self.get_logger().error('Failed to convert trajectory to joint positions')
-                self.get_logger().error('Please install pybullet: pip install pybullet')
-                return False
-            
-            # Store joint trajectory
-            self.current_joint_trajectory = joint_trajectory
-            
-            # Format joint trajectory for KUKA: j1,j2,j3,j4,j5,j6,j7 separated by semicolons
-            trajectory_str = ";".join([
-                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
-            ])
-            
-            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
-            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
-            self.get_logger().info('Using joint positions avoids workspace errors - all points should be reachable')
-            self.kuka_socket.sendall(command.encode('utf-8'))
-            
-            # Wait for completion using robust message receiving
-            complete = False
-            point_count = 0
-            error_count = 0
-            
-            while not complete:
-                response = self._receive_complete_message(self.kuka_socket, timeout=30.0)
-                if not response:
-                    self.get_logger().warn('No response from KUKA')
-                    break
-                
-                response = response.strip()
-                
-                if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count}, Errors (skipped): {error_count}')
-                    complete = True
-                    return True
-                elif "ERROR" in response:
-                    error_count += 1
-                    self.get_logger().warn(f'Point execution error (skipping): {response}')
-                elif "POINT_COMPLETE" in response:
-                    point_count += 1
-                    if point_count % 10 == 0:
-                        self.get_logger().info(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
-            
-            if not complete:
-                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors: {error_count}')
-                return point_count > 0  # Return True if some progress made
-            
-        except Exception as e:
-            self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return False
     
     def send_trajectory_to_kuka_with_interrupt_and_progress(self, trajectory, interrupt_event, 
                                                            point_count, point_count_lock):
@@ -1489,89 +1067,10 @@ class StandaloneDeformationController(Node):
             # Monitor execution progress, checking for interrupt and tracking point count
             complete = False
             error_count = 0
+            skipped_points = []
             
             with point_count_lock:
                 point_count[0] = 0  # Reset point count
-            
-            while not complete and interrupt_event.is_set():
-                # Use shorter timeout to check interrupt more frequently
-                response = self._receive_complete_message(self.kuka_socket, timeout=1.0)
-                if not response:
-                    # Timeout - check if we should continue
-                    if not interrupt_event.is_set():
-                        self.get_logger().info('Trajectory execution interrupted by conditioning request')
-                        return False
-                    continue
-                
-                response = response.strip()
-                
-                if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count[0]}, Errors (skipped): {error_count}')
-                    complete = True
-                    return True
-                elif "ERROR" in response:
-                    error_count += 1
-                    self.get_logger().warn(f'Point execution error (skipping): {response}')
-                elif "POINT_COMPLETE" in response:
-                    with point_count_lock:
-                        point_count[0] += 1
-                    if point_count[0] % 10 == 0:
-                        self.get_logger().info(f'Progress: {point_count[0]}/{len(joint_trajectory)} points completed')
-            
-            if not complete and not interrupt_event.is_set():
-                self.get_logger().info('Trajectory execution interrupted')
-                return False
-            elif not complete:
-                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count[0]}, Errors: {error_count}')
-                return point_count[0] > 0
-            
-            return True
-            
-        except Exception as e:
-            self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return False
-    
-    def send_trajectory_to_kuka_with_interrupt(self, trajectory, interrupt_event):
-        """Send trajectory to KUKA robot and monitor execution, can be interrupted
-        Similar to send_trajectory_to_kuka but checks interrupt_event to allow stopping"""
-        if self.kuka_socket is None:
-            self.get_logger().error('No connection to KUKA robot')
-            return False
-        
-        try:
-            # Validate trajectory format
-            traj_array = np.array(trajectory)
-            if traj_array.ndim != 2 or traj_array.shape[1] != 6:
-                self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
-                return False
-            
-            # Convert Cartesian to joint positions using pybullet IK
-            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
-            joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
-            
-            if joint_trajectory is None or len(joint_trajectory) == 0:
-                self.get_logger().error('Failed to convert trajectory to joint positions')
-                self.get_logger().error('Please install pybullet: pip install pybullet')
-                return False
-            
-            # Store joint trajectory
-            self.current_joint_trajectory = joint_trajectory
-            
-            # Format joint trajectory for KUKA
-            trajectory_str = ";".join([
-                ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
-            ])
-            
-            command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
-            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
-            self.kuka_socket.sendall(command.encode('utf-8'))
-            
-            # Monitor execution progress, checking for interrupt
-            complete = False
-            point_count = 0
-            error_count = 0
             
             while not complete and interrupt_event.is_set():
                 # Use shorter timeout to check interrupt more frequently
@@ -1586,23 +1085,32 @@ class StandaloneDeformationController(Node):
                 response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count}, Errors (skipped): {error_count}')
+                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count[0]}, Errors (skipped): {error_count}')
+                    if skipped_points:
+                        self.get_logger().warn(f'Skipped points: {skipped_points[:10]}' + ('...' if len(skipped_points) > 10 else ''))
                     complete = True
                     return True
                 elif "ERROR" in response:
                     error_count += 1
+                    if point_count[0] < len(joint_trajectory):
+                        skipped_points.append(point_count[0])
                     self.get_logger().warn(f'Point execution error (skipping): {response}')
                 elif "POINT_COMPLETE" in response:
-                    point_count += 1
-                    if point_count % 10 == 0:
-                        self.get_logger().info(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
+                    with point_count_lock:
+                        point_count[0] += 1
+                    if point_count[0] % 10 == 0:
+                        self.get_logger().info(f'Progress: {point_count[0]}/{len(joint_trajectory)} points completed (errors skipped: {error_count})')
             
             if not complete and not interrupt_event.is_set():
                 self.get_logger().info('Trajectory execution interrupted')
                 return False
             elif not complete:
-                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors: {error_count}')
-                return point_count > 0
+                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count[0]}, Errors (skipped): {error_count}')
+                if point_count[0] > 0:
+                    self.get_logger().info(f'Partial execution completed with {point_count[0]} successful points')
+                    return True
+                else:
+                    return False
             
             return True
             
@@ -1611,88 +1119,6 @@ class StandaloneDeformationController(Node):
             import traceback
             self.get_logger().error(traceback.format_exc())
             return False
-    
-    def send_trajectory_to_kuka_async(self, trajectory):
-        """Send trajectory to KUKA robot without blocking (for real-time updates)
-        Converts Cartesian to joint positions using pybullet IK"""
-        def send_and_monitor():
-            if self.kuka_socket is None:
-                self.get_logger().error('No connection to KUKA robot')
-                return
-            
-            try:
-                # Validate trajectory format
-                traj_array = np.array(trajectory)
-                if traj_array.ndim != 2 or traj_array.shape[1] != 6:
-                    self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
-                    return
-                
-                # Convert Cartesian to joint positions using pybullet IK
-                self.get_logger().info('Converting Cartesian trajectory to joint positions (async)...')
-                joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
-                
-                if joint_trajectory is None or len(joint_trajectory) == 0:
-                    self.get_logger().error('Failed to convert trajectory to joint positions')
-                    return
-                
-                # Store joint trajectory
-                self.current_joint_trajectory = joint_trajectory
-                
-                # Format joint trajectory for KUKA
-                trajectory_str = ";".join([
-                    ",".join([f"{val:.6f}" for val in point]) for point in joint_trajectory
-                ])
-                
-                command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
-                self.kuka_socket.sendall(command.encode('utf-8'))
-                self.get_logger().info(f'Sent joint trajectory to KUKA ({len(joint_trajectory)} points) - monitoring in background')
-                
-                # Monitor responses in background (non-blocking for main loop)
-                error_count = 0
-                point_count = 0
-                while True:
-                    try:
-                        response = self._receive_complete_message(self.kuka_socket, timeout=0.1)
-                        if not response:
-                            continue  # Timeout is expected - continue monitoring
-                        
-                        response = response.strip()
-                        
-                        if "TRAJECTORY_COMPLETE" in response:
-                            self.get_logger().info(f'Trajectory completed: {point_count} points, {error_count} errors')
-                            break
-                        elif "ERROR" in response:
-                            error_count += 1
-                            self.get_logger().warn(f'Trajectory execution error: {response}')
-                        elif "POINT_COMPLETE" in response:
-                            point_count += 1
-                    except socket.timeout:
-                        # Timeout is expected - continue monitoring
-                        continue
-                    except Exception as e:
-                        self.get_logger().error(f'Error monitoring trajectory: {e}')
-                        break
-            except Exception as e:
-                self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
-                import traceback
-                self.get_logger().error(traceback.format_exc())
-        
-        # Start trajectory sending in separate thread
-        thread = threading.Thread(target=send_and_monitor)
-        thread.daemon = True
-        thread.start()
-    
-    def publish_statistics(self):
-        """Publish execution statistics"""
-        stats = {
-            'deformation_count': self.deformation_count,
-            'conditioning_count': self.conditioning_count,
-            'total_energy': self.total_energy,
-            'average_energy': self.total_energy / max(self.deformation_count, 1)
-        }
-        
-        self.statistics_pub.publish(String(data=json.dumps(stats)))
-        self.get_logger().info(f'Execution statistics: {stats}')
     
     def save_promp(self, filename=None):
         """Save current ProMP state"""
@@ -1719,18 +1145,16 @@ def main(args=None):
     rclpy.init(args=args)
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Standalone Deformation Controller')
+    parser = argparse.ArgumentParser(description='ProMP Incremental Learning Controller')
     parser.add_argument('--kuka-ip', default='172.31.1.147', help='KUKA robot IP (matches train_and_execute.py)')
     parser.add_argument('--trajectory-file', default=os.path.join(os.path.expanduser('~/robotexecute'), 'learned_trajectory.npy'), help='Trajectory file path (default: ~/robotexecute/learned_trajectory.npy)')
     parser.add_argument('--promp-file', default='promp_model.npy', help='ProMP file path')
-    parser.add_argument('--energy-threshold', type=float, default=0.5, help='Energy threshold for conditioning')
-    parser.add_argument('--force-threshold', type=float, default=10.0, help='Force threshold for deformation')
-    parser.add_argument('--torque-threshold', type=float, default=2.0, help='Torque threshold for deformation')
+    parser.add_argument('--joint-torque-threshold', type=float, default=0.5, help='Joint torque threshold for deformation and incremental learning (Nm)')
     
     args, _ = parser.parse_known_args()
     
     # Create node with parameters
-    node = StandaloneDeformationController()
+    node = ProMPIncController()
     
     try:
         rclpy.spin(node)
