@@ -20,6 +20,8 @@ from collections import deque
 import json
 import argparse
 import os
+import csv
+from datetime import datetime
 from .trajectory_deformer import TrajectoryDeformer
 from .promp import ProMP
 from .stepwise_em_learner import StepwiseEMLearner
@@ -140,6 +142,12 @@ class StandaloneDeformationController(Node):
         self.deformation_count = 0
         self.conditioning_count = 0
         self.total_energy = 0.0
+        
+        # CSV logging data structures
+        self.execution_trajectory_log = []  # Track final execution trajectory (Cartesian)
+        self.joint_torque_log = []  # Track all joint torques during execution
+        self.external_torque_log = []  # Track all external torques during execution
+        self.result_directory = os.path.join(os.path.expanduser('~/result'), 'standalone_deformation_controller')
         
         # Setup communication
         self.setup_communication()
@@ -852,6 +860,15 @@ class StandaloneDeformationController(Node):
         num_points = trajectory.shape[0]
         dt = 0.01  # 100 Hz monitoring rate
         
+        # Initialize CSV logging data structures
+        self.execution_trajectory_log = []
+        self.joint_torque_log = []
+        self.external_torque_log = []
+        
+        # Create result directory
+        os.makedirs(self.result_directory, exist_ok=True)
+        self.get_logger().info(f'CSV logging enabled. Results will be saved to: {self.result_directory}')
+        
         # Step 1: Execute the initial trajectory first (like train_and_execute.py)
         # This ensures the robot actually starts moving
         self.get_logger().info('Starting trajectory execution...')
@@ -906,6 +923,12 @@ class StandaloneDeformationController(Node):
                 latest_joint_torques = self.joint_torque_data[-1]
                 joint_torques = latest_joint_torques['joint_torques']
                 max_joint_torque = max(abs(t) for t in joint_torques)
+                
+                # Log joint torques to CSV
+                self.joint_torque_log.append({
+                    'timestamp': latest_joint_torques['timestamp'],
+                    'joint_torques': joint_torques.copy()
+                })
                 
                 # Log joint torques periodically (every 50 samples)
                 if len(self.joint_torque_data) % 50 == 0:
@@ -978,6 +1001,14 @@ class StandaloneDeformationController(Node):
             # Check for external torque/force during execution (legacy support)
             if len(self.torque_data) > 0:
                 latest = self.torque_data[-1]
+                
+                # Log external torque to CSV
+                self.external_torque_log.append({
+                    'timestamp': latest['timestamp'],
+                    'force': latest['force'].copy(),
+                    'torque': latest['torque'].copy()
+                })
+                
                 max_force = max(abs(f) for f in latest['force'])
                 max_torque = max(abs(t) for t in latest['torque'])
                 
@@ -1102,6 +1133,9 @@ class StandaloneDeformationController(Node):
         self.is_executing = False
         self.get_logger().info('Trajectory execution finished')
         self.execution_status_pub.publish(String(data='EXECUTION_STOPPED'))
+        
+        # Save CSV files
+        self.save_execution_data_to_csv()
     
     def stop_execution(self):
         """Stop trajectory execution"""
@@ -1116,6 +1150,9 @@ class StandaloneDeformationController(Node):
         
         self.get_logger().info('Stopped trajectory execution')
         self.execution_status_pub.publish(String(data='EXECUTION_STOPPED'))
+        
+        # Save CSV files
+        self.save_execution_data_to_csv()
         
         # Publish final statistics
         self.publish_statistics()
@@ -1714,6 +1751,57 @@ class StandaloneDeformationController(Node):
             self.get_logger().info(f'ProMP saved to {filename}')
         except Exception as e:
             self.get_logger().error(f'Error saving ProMP: {e}')
+    
+    def save_execution_data_to_csv(self):
+        """Save execution trajectory, joint torques, and external torques to CSV files"""
+        try:
+            # Create result directory if it doesn't exist
+            os.makedirs(self.result_directory, exist_ok=True)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # Save execution trajectory
+            if len(self.execution_trajectory_log) > 0:
+                traj_file = os.path.join(self.result_directory, f'execution_trajectory_{timestamp}.csv')
+                with open(traj_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['x_m', 'y_m', 'z_m', 'alpha_rad', 'beta_rad', 'gamma_rad'])
+                    for point in self.execution_trajectory_log:
+                        writer.writerow(point)
+                self.get_logger().info(f'Saved execution trajectory to {traj_file} ({len(self.execution_trajectory_log)} points)')
+            else:
+                self.get_logger().warn('No execution trajectory data to save')
+            
+            # Save joint torques
+            if len(self.joint_torque_log) > 0:
+                joint_torque_file = os.path.join(self.result_directory, f'joint_torques_{timestamp}.csv')
+                with open(joint_torque_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['timestamp_s', 'joint1_Nm', 'joint2_Nm', 'joint3_Nm', 'joint4_Nm', 'joint5_Nm', 'joint6_Nm', 'joint7_Nm'])
+                    for entry in self.joint_torque_log:
+                        row = [entry['timestamp']] + entry['joint_torques']
+                        writer.writerow(row)
+                self.get_logger().info(f'Saved joint torques to {joint_torque_file} ({len(self.joint_torque_log)} samples)')
+            else:
+                self.get_logger().warn('No joint torque data to save')
+            
+            # Save external torques
+            if len(self.external_torque_log) > 0:
+                external_torque_file = os.path.join(self.result_directory, f'external_torques_{timestamp}.csv')
+                with open(external_torque_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['timestamp_s', 'force_x_N', 'force_y_N', 'force_z_N', 'torque_x_Nm', 'torque_y_Nm', 'torque_z_Nm'])
+                    for entry in self.external_torque_log:
+                        row = [entry['timestamp']] + entry['force'] + entry['torque']
+                        writer.writerow(row)
+                self.get_logger().info(f'Saved external torques to {external_torque_file} ({len(self.external_torque_log)} samples)')
+            else:
+                self.get_logger().warn('No external torque data to save')
+                
+        except Exception as e:
+            self.get_logger().error(f'Error saving execution data to CSV: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
 
 def main(args=None):
     rclpy.init(args=args)
