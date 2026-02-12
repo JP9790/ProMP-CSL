@@ -529,12 +529,20 @@ class AIRLExecute(Node):
                         demo_normalized = demo
                     normalized_demos.append(demo_normalized)
             
-            trajectory_normalized = self.airl.generate_trajectory(
-                initial_state_normalized,
-                num_points=self.trajectory_points,
-                dt=0.01,
-                demonstrations=normalized_demos if len(normalized_demos) > 0 else None
-            )
+            # Generate trajectory - pass demonstrations if available
+            if len(normalized_demos) > 0:
+                trajectory_normalized = self.airl.generate_trajectory(
+                    initial_state_normalized,
+                    num_points=self.trajectory_points,
+                    dt=0.01,
+                    demonstrations=normalized_demos
+                )
+            else:
+                trajectory_normalized = self.airl.generate_trajectory(
+                    initial_state_normalized,
+                    num_points=self.trajectory_points,
+                    dt=0.01
+                )
             
             # Denormalize trajectory back to original scale
             if self.demo_min is not None and self.demo_max is not None:
