@@ -122,6 +122,9 @@ class AIRLController(Node):
         self.external_torque_log = []  # Track all external torques during execution
         self.result_directory = os.path.join(os.path.expanduser('~/result'), 'airl_controller')
         
+        # Thread lock for pybullet IK (pybullet is not thread-safe)
+        self.pybullet_lock = threading.Lock()
+        
         # Setup communication
         self.setup_communication()
         
@@ -221,129 +224,164 @@ class AIRLController(Node):
     
     def cartesian_to_joint_python(self, cartesian_poses):
         """Convert Cartesian poses to joint positions using pybullet IK solver
-        Matches train_and_execute.py implementation"""
-        try:
-            import pybullet as p
-            import pybullet_data
-            
-            self.get_logger().info('Using pybullet for IK computation (most reliable for KUKA)')
-            
-            # Initialize pybullet in DIRECT mode (no GUI, faster)
-            physics_client = p.connect(p.DIRECT)
-            p.setAdditionalSearchPath(pybullet_data.getDataPath())
-            
-            # Try to load KUKA LBR iiwa URDF from common locations
-            robot_id = None
-            urdf_paths = [
-                "kuka_iiwa/model.urdf",  # pybullet_data
-                "kuka_lbr_iiwa_14_r820.urdf",  # Common name
-                "/opt/ros/noetic/share/kuka_description/urdf/kuka_lbr_iiwa_14_r820.urdf",  # ROS path
-            ]
-            
-            for urdf_path in urdf_paths:
+        Matches train_and_execute.py implementation
+        Thread-safe: uses lock to prevent concurrent pybullet access"""
+        # Use lock to ensure thread-safe access to pybullet (pybullet is not thread-safe)
+        with self.pybullet_lock:
+            try:
+                import pybullet as p
+                import pybullet_data
+                
+                self.get_logger().info('Using pybullet for IK computation (most reliable for KUKA)')
+                
+                # Initialize pybullet in DIRECT mode (no GUI, faster)
+                # Check if already connected (pybullet allows only one connection)
                 try:
-                    robot_id = p.loadURDF(urdf_path, [0, 0, 0], useFixedBase=True)
-                    self.get_logger().info(f'Loaded KUKA URDF from: {urdf_path}')
-                    break
+                    # Try to get connection info - if this fails, we're not connected
+                    p.getConnectionInfo()
+                    # Already connected - disconnect first to avoid conflicts
+                    self.get_logger().warn('Pybullet already connected, disconnecting first...')
+                    p.disconnect()
                 except:
-                    continue
-            
-            # If URDF not found, create a simple 7-DOF model
-            if robot_id is None:
-                self.get_logger().warn('KUKA URDF not found, creating simplified 7-DOF model')
-                robot_id = self._create_simple_kuka_model(p)
-            
-            if robot_id is None:
-                self.get_logger().error('Failed to create robot model')
-                p.disconnect()
-                return None
-            
-            # Get number of joints
-            num_joints = p.getNumJoints(robot_id)
-            end_effector_link = num_joints - 1
-            
-            joint_positions = []
-            failed_count = 0
-            
-            # Initial joint configuration (seed for IK)
-            initial_joints = [0.0, 0.7854, 0.0, -1.3962, 0.0, -0.6109, 0.0]
-            current_joints = initial_joints.copy()
-            
-            self.get_logger().info(f'Computing IK for {len(cartesian_poses)} poses using pybullet...')
-            
-            for i, pose in enumerate(cartesian_poses):
-                x, y, z, alpha, beta, gamma = pose
-                target_pos = [x, y, z]
-                target_orn = p.getQuaternionFromEuler([alpha, beta, gamma])
+                    # Not connected, which is fine
+                    pass
                 
-                try:
-                    # Compute IK using pybullet's built-in solver
-                    joint_angles = p.calculateInverseKinematics(
-                        robot_id,
-                        end_effector_link,
-                        target_pos,
-                        target_orn,
-                        lowerLimits=[-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054],
-                        upperLimits=[2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054],
-                        jointRanges=[5.934, 4.188, 5.934, 4.188, 5.934, 4.188, 6.108],
-                        restPoses=current_joints,
-                        maxNumIterations=200,
-                        residualThreshold=1e-5
-                    )
+                physics_client = p.connect(p.DIRECT)
+                if physics_client < 0:
+                    self.get_logger().error('Failed to connect to pybullet physics server')
+                    return None
+                
+                p.setAdditionalSearchPath(pybullet_data.getDataPath())
+            
+                # Try to load KUKA LBR iiwa URDF from common locations
+                robot_id = None
+                urdf_paths = [
+                    "kuka_iiwa/model.urdf",  # pybullet_data
+                    "kuka_lbr_iiwa_14_r820.urdf",  # Common name
+                    "/opt/ros/noetic/share/kuka_description/urdf/kuka_lbr_iiwa_14_r820.urdf",  # ROS path
+                ]
+                
+                for urdf_path in urdf_paths:
+                    try:
+                        robot_id = p.loadURDF(urdf_path, [0, 0, 0], useFixedBase=True)
+                        self.get_logger().info(f'Loaded KUKA URDF from: {urdf_path}')
+                        break
+                    except:
+                        continue
+                
+                # If URDF not found, create a simple 7-DOF model
+                if robot_id is None:
+                    self.get_logger().warn('KUKA URDF not found, creating simplified 7-DOF model')
+                    robot_id = self._create_simple_kuka_model(p)
+                
+                if robot_id is None:
+                    self.get_logger().error('Failed to create robot model')
+                    p.disconnect()
+                    return None
+                
+                # Get number of joints
+                num_joints = p.getNumJoints(robot_id)
+                end_effector_link = num_joints - 1
+                
+                joint_positions = []
+                failed_count = 0
+                
+                # Initial joint configuration (seed for IK)
+                initial_joints = [0.0, 0.7854, 0.0, -1.3962, 0.0, -0.6109, 0.0]
+                current_joints = initial_joints.copy()
+                
+                self.get_logger().info(f'Computing IK for {len(cartesian_poses)} poses using pybullet...')
+                
+                for i, pose in enumerate(cartesian_poses):
+                    x, y, z, alpha, beta, gamma = pose
+                    target_pos = [x, y, z]
+                    target_orn = p.getQuaternionFromEuler([alpha, beta, gamma])
                     
-                    if joint_angles is not None and len(joint_angles) >= 7:
-                        joint_angles_7 = list(joint_angles[:7])
+                    try:
+                        # Verify connection is still active before computing IK
+                        try:
+                            p.getConnectionInfo()
+                        except:
+                            self.get_logger().error('Pybullet connection lost during IK computation')
+                            raise RuntimeError('Pybullet connection lost')
                         
-                        # Verify joint limits
-                        valid = True
-                        limits = [(-2.967, 2.967), (-2.094, 2.094), (-2.967, 2.967),
-                                 (-2.094, 2.094), (-2.967, 2.967), (-2.094, 2.094),
-                                 (-3.054, 3.054)]
-                        for j, (angle, (min_val, max_val)) in enumerate(zip(joint_angles_7, limits)):
-                            if angle < min_val or angle > max_val:
-                                valid = False
-                                break
+                        # Compute IK using pybullet's built-in solver
+                        joint_angles = p.calculateInverseKinematics(
+                            robot_id,
+                            end_effector_link,
+                            target_pos,
+                            target_orn,
+                            lowerLimits=[-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054],
+                            upperLimits=[2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054],
+                            jointRanges=[5.934, 4.188, 5.934, 4.188, 5.934, 4.188, 6.108],
+                            restPoses=current_joints,
+                            maxNumIterations=200,
+                            residualThreshold=1e-5
+                        )
                         
-                        if valid:
-                            joint_positions.append(joint_angles_7)
-                            current_joints = joint_angles_7.copy()
-                        else:
-                            if len(joint_positions) > 0:
-                                joint_positions.append(joint_positions[-1])
+                        if joint_angles is not None and len(joint_angles) >= 7:
+                            joint_angles_7 = list(joint_angles[:7])
+                            
+                            # Verify joint limits
+                            valid = True
+                            limits = [(-2.967, 2.967), (-2.094, 2.094), (-2.967, 2.967),
+                                     (-2.094, 2.094), (-2.967, 2.967), (-2.094, 2.094),
+                                     (-3.054, 3.054)]
+                            for j, (angle, (min_val, max_val)) in enumerate(zip(joint_angles_7, limits)):
+                                if angle < min_val or angle > max_val:
+                                    valid = False
+                                    break
+                            
+                            if valid:
+                                joint_positions.append(joint_angles_7)
+                                current_joints = joint_angles_7.copy()
                             else:
-                                joint_positions.append(initial_joints)
-                            failed_count += 1
-                    else:
-                        raise ValueError("IK returned invalid result")
-                        
-                except Exception as e:
-                    self.get_logger().warn(f'Pybullet IK failed for point {i}: {e}')
-                    failed_count += 1
-                    if len(joint_positions) > 0:
-                        joint_positions.append(joint_positions[-1])
-                    else:
-                        joint_positions.append(initial_joints)
+                                if len(joint_positions) > 0:
+                                    joint_positions.append(joint_positions[-1])
+                                else:
+                                    joint_positions.append(initial_joints)
+                                failed_count += 1
+                        else:
+                            raise ValueError("IK returned invalid result")
+                            
+                    except Exception as e:
+                        self.get_logger().warn(f'Pybullet IK failed for point {i}: {e}')
+                        failed_count += 1
+                        if len(joint_positions) > 0:
+                            joint_positions.append(joint_positions[-1])
+                        else:
+                            joint_positions.append(initial_joints)
+                    
+                    if (i + 1) % 10 == 0:
+                        self.get_logger().info(f'Pybullet IK progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
                 
-                if (i + 1) % 10 == 0:
-                    self.get_logger().info(f'Pybullet IK progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
-            
-            p.disconnect()
-            
-            if failed_count == 0:
-                self.get_logger().info(f'Successfully computed IK for all {len(cartesian_poses)} poses using pybullet')
-            else:
-                self.get_logger().warn(f'IK computed with {failed_count} failures (used previous/initial positions)')
-            
-            return np.array(joint_positions)
-            
-        except ImportError:
-            self.get_logger().error('pybullet not installed. Install with: pip install pybullet')
-            return None
-        except Exception as e:
-            self.get_logger().error(f'pybullet IK failed: {e}')
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return None
+                # Disconnect pybullet before releasing lock
+                try:
+                    p.disconnect()
+                except:
+                    pass  # Ignore disconnect errors
+                
+                if failed_count == 0:
+                    self.get_logger().info(f'Successfully computed IK for all {len(cartesian_poses)} poses using pybullet')
+                else:
+                    self.get_logger().warn(f'IK computed with {failed_count} failures (used previous/initial positions)')
+                
+                return np.array(joint_positions)
+                
+            except ImportError:
+                self.get_logger().error('pybullet not installed. Install with: pip install pybullet')
+                return None
+            except Exception as e:
+                self.get_logger().error(f'pybullet IK failed: {e}')
+                import traceback
+                self.get_logger().error(traceback.format_exc())
+                # Ensure pybullet is disconnected even on error
+                try:
+                    import pybullet as p
+                    p.disconnect()
+                except:
+                    pass
+                return None
     
     def _create_simple_kuka_model(self, p):
         """Create a simple 7-DOF KUKA LBR iiwa model for IK"""
@@ -820,6 +858,14 @@ class AIRLController(Node):
                 self.get_logger().error(f'Invalid trajectory shape: {traj_array.shape}. Expected (N, 6)')
                 return False
             
+            # Log trajectory info before IK conversion
+            self.get_logger().info(f'Trajectory shape: {traj_array.shape}')
+            self.get_logger().info(f'Trajectory range - X: [{traj_array[:, 0].min():.3f}, {traj_array[:, 0].max():.3f}], '
+                                  f'Y: [{traj_array[:, 1].min():.3f}, {traj_array[:, 1].max():.3f}], '
+                                  f'Z: [{traj_array[:, 2].min():.3f}, {traj_array[:, 2].max():.3f}]')
+            self.get_logger().info(f'First point: {traj_array[0]}')
+            self.get_logger().info(f'Last point: {traj_array[-1]}')
+            
             # Convert Cartesian to joint positions using pybullet IK
             self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
             joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
@@ -828,6 +874,19 @@ class AIRLController(Node):
                 self.get_logger().error('Failed to convert trajectory to joint positions')
                 self.get_logger().error('Please install pybullet: pip install pybullet')
                 return False
+            
+            # Log joint trajectory info
+            self.get_logger().info(f'Joint trajectory shape: {joint_trajectory.shape}')
+            self.get_logger().info(f'Joint trajectory range - J1: [{joint_trajectory[:, 0].min():.3f}, {joint_trajectory[:, 0].max():.3f}], '
+                                  f'J2: [{joint_trajectory[:, 1].min():.3f}, {joint_trajectory[:, 1].max():.3f}]')
+            self.get_logger().info(f'First joint position: {joint_trajectory[0]}')
+            self.get_logger().info(f'Last joint position: {joint_trajectory[-1]}')
+            
+            # Check if joint trajectory has variation (not all same values)
+            joint_variation = np.std(joint_trajectory, axis=0)
+            if np.any(joint_variation < 1e-6):
+                self.get_logger().warn(f'Warning: Some joints have very little variation: {joint_variation}')
+                self.get_logger().warn('This might indicate IK conversion issues or trajectory generation problems')
             
             # Store joint trajectory
             self.current_joint_trajectory = joint_trajectory
@@ -840,6 +899,7 @@ class AIRLController(Node):
             command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
             self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
             self.get_logger().info('Using joint positions avoids workspace errors - all points should be reachable')
+            self.get_logger().info(f'Command length: {len(command)} bytes')
             self.kuka_socket.sendall(command.encode('utf-8'))
             
             # Wait for completion - handle fragmented responses and skip errors (matches train_and_execute.py)
