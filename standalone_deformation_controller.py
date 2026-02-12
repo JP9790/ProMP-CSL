@@ -931,11 +931,29 @@ class StandaloneDeformationController(Node):
                 if success:
                     self.get_logger().info('Initial trajectory execution completed')
                 else:
-                    self.get_logger().warn('Initial trajectory execution had errors')
+                    self.get_logger().warn('Initial trajectory execution had errors, but continuing monitoring...')
+                    # Even if there were errors, continue monitoring - some points may have executed
+                    # Set point_count to indicate we've started (even if partially)
+                    with point_count_lock:
+                        if point_count[0] == 0:
+                            # No points executed, set to 1 to allow monitoring to continue
+                            point_count[0] = 1
             except Exception as e:
                 self.get_logger().error(f'Error in trajectory execution: {e}')
+                import traceback
+                self.get_logger().error(traceback.format_exc())
+                # Set point_count to allow monitoring to continue even after error
+                with point_count_lock:
+                    if point_count[0] == 0:
+                        point_count[0] = 1
             finally:
-                trajectory_executing.clear()  # Mark as finished
+                # Only clear if trajectory actually finished completely
+                # If interrupted, keep it set so monitoring can detect it
+                if not trajectory_executing.is_set():
+                    # Trajectory was interrupted, don't clear
+                    pass
+                else:
+                    trajectory_executing.clear()  # Mark as finished
         
         # Start trajectory execution in background thread
         execution_thread = threading.Thread(target=execute_trajectory_with_monitoring, args=(trajectory,))
@@ -950,11 +968,25 @@ class StandaloneDeformationController(Node):
         conditioning_cooldown = 0.3  # Minimum time between conditioning (seconds)
         
         while self.is_executing:
+            # Check if trajectory execution thread is still alive
+            if execution_thread is not None and not execution_thread.is_alive():
+                # Thread finished (either completed or errored)
+                # Check if trajectory_executing flag was cleared
+                if not trajectory_executing.is_set():
+                    # Trajectory finished or was interrupted
+                    # Continue monitoring for a bit to allow for any final torque data
+                    self.get_logger().info('Trajectory execution thread finished, continuing monitoring...')
+                    # Don't break - continue monitoring loop
+                else:
+                    # Thread died but flag is still set - something went wrong
+                    self.get_logger().warn('Trajectory execution thread died unexpectedly, but continuing monitoring...')
+            
             # Check if trajectory is still executing
             if not trajectory_executing.is_set() and execution_thread is not None:
-                # Trajectory finished, wait a bit and check if we should continue
-                time.sleep(0.1)
-                continue
+                # Trajectory finished or was interrupted, but continue monitoring
+                # This allows the system to continue monitoring torques even after trajectory completes
+                # or if there were errors
+                pass
             
             # Monitor joint torques during execution and check thresholds
             if len(self.joint_torque_data) > 0:
