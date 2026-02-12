@@ -139,10 +139,13 @@ class AIRL:
         
         self.get_logger().info(f'Training AIRL on {len(demonstrations)} demonstrations...')
         
+        # Get logger to pass to training methods
+        logger = self.get_logger()
+        
         if self.use_torch:
-            self._train_torch(demonstrations, num_iterations, batch_size)
+            self._train_torch(demonstrations, num_iterations, batch_size, logger)
         else:
-            self._train_numpy(demonstrations, num_iterations)
+            self._train_numpy(demonstrations, num_iterations, logger)
     
     def _train_torch(self, demonstrations, num_iterations, batch_size, logger):
         """Train AIRL using PyTorch"""
