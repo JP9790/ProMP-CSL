@@ -1833,13 +1833,19 @@ class StandaloneDeformationController(Node):
                 point_count[0] = 0  # Reset point count
             
             while not complete and interrupt_event.is_set():
-                # Use shorter timeout to check interrupt more frequently
-                response = self._receive_complete_message(self.kuka_socket, timeout=1.0)
+                # Use longer timeout like train_and_execute.py (30s) but check interrupt periodically
+                # Check interrupt first before waiting for response
+                if not interrupt_event.is_set():
+                    self.get_logger().debug('Trajectory execution interrupted by conditioning request')
+                    return False
+                
+                response = self._receive_complete_message(self.kuka_socket, timeout=30.0)
                 if not response:
-                    # Timeout - check if we should continue
+                    # Timeout - check if we should continue or if interrupted
                     if not interrupt_event.is_set():
-                        self.get_logger().debug('Trajectory execution interrupted by conditioning request')
+                        self.get_logger().debug('Trajectory execution interrupted during timeout')
                         return False
+                    # Continue waiting if still executing
                     continue
                 
                 response = response.strip()
@@ -1862,27 +1868,60 @@ class StandaloneDeformationController(Node):
                         point_count[0] += 1
                         current_point_idx = point_count[0]
                     
-                    # Log executed trajectory point (Cartesian) - use planned trajectory
-                    # Note: We log the planned trajectory point, which should match what was executed
+                    # Log executed trajectory point (Cartesian) - matching train_and_execute.py exactly
                     if current_point_idx <= len(trajectory):
                         self.execution_trajectory_log.append(trajectory[current_point_idx - 1].tolist())
-                    else:
-                        self.get_logger().warn(f'Point index {current_point_idx} exceeds trajectory length {len(trajectory)}')
                     
-                    # Debug logging every 10 points to verify logging is working
+                    # Log joint torques if available (matching train_and_execute.py)
+                    if len(self.joint_torque_data) > 0:
+                        latest_joint = self.joint_torque_data[-1]
+                        self.joint_torque_log.append({
+                            'timestamp': latest_joint['timestamp'],
+                            'joint_torques': latest_joint['joint_torques'].copy()
+                        })
+                    
+                    # Log external torques if available (matching train_and_execute.py)
+                    if len(self.torque_data) > 0:
+                        latest_torque = self.torque_data[-1]
+                        self.external_torque_log.append({
+                            'timestamp': latest_torque['timestamp'],
+                            'force': latest_torque['force'].copy(),
+                            'torque': latest_torque['torque'].copy()
+                        })
+                    
+                    # Log progress every 10 points (matching train_and_execute.py)
                     if current_point_idx % 10 == 0:
-                        self.get_logger().info(f'Progress: {current_point_idx}/{len(joint_trajectory)} points completed, logged {len(self.execution_trajectory_log)} trajectory points')
-                    elif current_point_idx % 50 == 0:  # Reduced logging frequency
-                        self.get_logger().debug(f'Progress: {current_point_idx}/{len(joint_trajectory)} points completed')
+                        self.get_logger().info(f'Progress: {current_point_idx}/{len(joint_trajectory)} points completed (logged: {len(self.execution_trajectory_log)} trajectory points, errors skipped: {error_count})')
             
             if not complete and not interrupt_event.is_set():
                 self.get_logger().debug('Trajectory execution interrupted')
+                # Log partial trajectory if execution was interrupted (matching train_and_execute.py)
+                with point_count_lock:
+                    executed_points = point_count[0]
+                if executed_points > 0 and executed_points < len(trajectory):
+                    # Add remaining points from planned trajectory for partial execution
+                    remaining_points = trajectory[executed_points:].tolist()
+                    self.execution_trajectory_log.extend(remaining_points)
                 return False
             elif not complete:
                 with point_count_lock:
                     executed_points = point_count[0]
-                self.get_logger().debug(f'Trajectory execution ended. Points: {executed_points}, Errors: {error_count}')
+                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {executed_points}, Errors: {error_count}')
+                # Log partial trajectory if execution was interrupted (matching train_and_execute.py)
+                if executed_points > 0 and executed_points < len(trajectory):
+                    remaining_points = trajectory[executed_points:].tolist()
+                    self.execution_trajectory_log.extend(remaining_points)
                 return executed_points > 0
+            
+            # If complete, ensure all trajectory points are logged (matching train_and_execute.py)
+            if complete:
+                with point_count_lock:
+                    executed_points = point_count[0]
+                # If we have fewer logged points than executed, add remaining from planned trajectory
+                if len(self.execution_trajectory_log) < executed_points and executed_points <= len(trajectory):
+                    for i in range(len(self.execution_trajectory_log), executed_points):
+                        if i < len(trajectory):
+                            self.execution_trajectory_log.append(trajectory[i].tolist())
             
             return True
             
