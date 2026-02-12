@@ -26,6 +26,7 @@ setup(
             'demo_recorder = kuka_promp_control.demo_recorder:main',
             'interactive_demo_recorder = kuka_promp_control.interactive_demo_recorder:main',
             'train_and_execute = kuka_promp_control.train_and_execute:main',
+            'stepwise_em_learner_execute = kuka_promp_control.stepwise_em_learner_execute:main',
             'train_promp_only_node = kuka_promp_control.train_promp_only_node:main',
             'standalone_deformation_controller = kuka_promp_control.standalone_deformation_controller:main',
             'airl_controller = kuka_promp_control.AIRL_controller:main',
