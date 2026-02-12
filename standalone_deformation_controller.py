@@ -307,9 +307,41 @@ class StandaloneDeformationController(Node):
                     p.disconnect()
                     return None
                 
-                # Get number of joints
+                # Get number of joints and find end-effector link
                 num_joints = p.getNumJoints(robot_id)
+                self.get_logger().info(f'Robot model has {num_joints} joints')
+                
+                # For KUKA LBR iiwa, end-effector is typically the last link
+                # Try to find the actual end-effector link index
                 end_effector_link = num_joints - 1
+                
+                # Verify end-effector link by checking joint info
+                # For KUKA LBR iiwa, the end-effector is usually link 6 (index 6) or link 7
+                # Try to find link 6 first (most common), then link 7, otherwise use last link
+                found_ee_link = False
+                for i in range(num_joints):
+                    try:
+                        joint_info = p.getJointInfo(robot_id, i)
+                        joint_name = joint_info[1].decode('utf-8') if isinstance(joint_info[1], bytes) else str(joint_info[1])
+                        
+                        # For KUKA LBR iiwa, end-effector is typically link 6 (index 6) or link 7
+                        if 'iiwa_link_6' in joint_name.lower() or 'link_6' in joint_name.lower():
+                            end_effector_link = i
+                            self.get_logger().info(f'Found end-effector link 6 at index: {end_effector_link} (joint name: {joint_name})')
+                            found_ee_link = True
+                            break
+                        elif 'iiwa_link_7' in joint_name.lower() or 'link_7' in joint_name.lower():
+                            end_effector_link = i
+                            self.get_logger().info(f'Found end-effector link 7 at index: {end_effector_link} (joint name: {joint_name})')
+                            found_ee_link = True
+                            break
+                    except:
+                        continue
+                
+                # If we didn't find a specific link, use the last link (fallback)
+                if not found_ee_link:
+                    self.get_logger().info(f'Using last link as end-effector: index {end_effector_link} (total joints: {num_joints})')
+                    self.get_logger().info('Note: If IK fails, try specifying the correct end-effector link index manually')
                 
                 joint_positions = []
                 failed_count = 0
@@ -319,6 +351,8 @@ class StandaloneDeformationController(Node):
                 current_joints = initial_joints.copy()
                 
                 self.get_logger().info(f'Computing IK for {len(cartesian_poses)} poses using pybullet...')
+                self.get_logger().info(f'First Cartesian pose: {cartesian_poses[0]}')
+                self.get_logger().info(f'Last Cartesian pose: {cartesian_poses[-1]}')
                 
                 for i, pose in enumerate(cartesian_poses):
                     x, y, z, alpha, beta, gamma = pose
@@ -363,7 +397,13 @@ class StandaloneDeformationController(Node):
                             if valid:
                                 joint_positions.append(joint_angles_7)
                                 current_joints = joint_angles_7.copy()
+                                # Log first and last successful IK solution for debugging
+                                if i == 0:
+                                    self.get_logger().info(f'First IK solution: {joint_angles_7}')
+                                elif i == len(cartesian_poses) - 1:
+                                    self.get_logger().info(f'Last IK solution: {joint_angles_7}')
                             else:
+                                self.get_logger().warn(f'IK solution for point {i} violates joint limits: {joint_angles_7}')
                                 if len(joint_positions) > 0:
                                     joint_positions.append(joint_positions[-1])
                                 else:
@@ -393,6 +433,26 @@ class StandaloneDeformationController(Node):
                     self.get_logger().info(f'Successfully computed IK for all {len(cartesian_poses)} poses using pybullet')
                 else:
                     self.get_logger().warn(f'IK computed with {failed_count} failures (used previous/initial positions)')
+                
+                # Verify joint trajectory has variation (not all the same)
+                joint_traj_array = np.array(joint_positions)
+                if len(joint_traj_array) > 1:
+                    joint_variation = np.std(joint_traj_array, axis=0)
+                    self.get_logger().info(f'Joint trajectory variation (std dev): {joint_variation}')
+                    
+                    # Check if all points are the same (robot won't move)
+                    if np.all(joint_variation < 1e-6):
+                        self.get_logger().error('WARNING: All joint positions are identical! Robot will not move.')
+                        self.get_logger().error('This suggests IK failed for all points. Check:')
+                        self.get_logger().error('  1. URDF model is correct')
+                        self.get_logger().error('  2. Cartesian poses are reachable')
+                        self.get_logger().error('  3. End-effector link index is correct')
+                        self.get_logger().error(f'First joint position: {joint_traj_array[0]}')
+                        self.get_logger().error(f'Last joint position: {joint_traj_array[-1]}')
+                    else:
+                        self.get_logger().info(f'Joint trajectory has variation - robot should move')
+                        self.get_logger().info(f'First joint position: {joint_traj_array[0]}')
+                        self.get_logger().info(f'Last joint position: {joint_traj_array[-1]}')
                 
                 return np.array(joint_positions)
                 
@@ -1694,6 +1754,25 @@ class StandaloneDeformationController(Node):
                 self.get_logger().error('Please install pybullet: pip install pybullet')
                 return False
             
+            # Verify joint trajectory has variation (not all points the same)
+            joint_traj_array = np.array(joint_trajectory)
+            if len(joint_traj_array) > 1:
+                joint_variation = np.std(joint_traj_array, axis=0)
+                max_variation = np.max(joint_variation)
+                
+                if max_variation < 1e-4:
+                    self.get_logger().error(f'CRITICAL: Joint trajectory has no variation (max std: {max_variation:.6f})!')
+                    self.get_logger().error('All joint positions are identical - robot will not move!')
+                    self.get_logger().error('This indicates IK conversion failed. Check:')
+                    self.get_logger().error('  1. URDF model is loaded correctly')
+                    self.get_logger().error('  2. End-effector link index is correct')
+                    self.get_logger().error('  3. Cartesian poses are within robot workspace')
+                    self.get_logger().error(f'First joint pos: {joint_traj_array[0]}')
+                    self.get_logger().error(f'Last joint pos: {joint_traj_array[-1]}')
+                    return False
+                else:
+                    self.get_logger().info(f'Joint trajectory validated: max variation = {max_variation:.6f} rad')
+            
             # Store joint trajectory
             self.current_joint_trajectory = joint_trajectory
             
@@ -1764,6 +1843,26 @@ class StandaloneDeformationController(Node):
             if joint_trajectory is None or len(joint_trajectory) == 0:
                 self.get_logger().error('Failed to convert trajectory to joint positions')
                 return False
+            
+            # Verify joint trajectory has variation (not all points the same)
+            joint_traj_array = np.array(joint_trajectory)
+            if len(joint_traj_array) > 1:
+                joint_variation = np.std(joint_traj_array, axis=0)
+                max_variation = np.max(joint_variation)
+                
+                if max_variation < 1e-4:
+                    self.get_logger().error(f'CRITICAL: Joint trajectory has no variation (max std: {max_variation:.6f})!')
+                    self.get_logger().error('All joint positions are identical - robot will not move!')
+                    self.get_logger().error('This indicates IK conversion failed. Check:')
+                    self.get_logger().error('  1. URDF model is loaded correctly')
+                    self.get_logger().error('  2. End-effector link index is correct')
+                    self.get_logger().error('  3. Cartesian poses are within robot workspace')
+                    self.get_logger().error(f'First joint pos: {joint_traj_array[0]}')
+                    self.get_logger().error(f'Last joint pos: {joint_traj_array[-1]}')
+                    return False
+                else:
+                    self.get_logger().info(f'Joint trajectory validated: max variation = {max_variation:.6f} rad')
+                    self.get_logger().info(f'Joint variation per joint: {joint_variation}')
             
             # Store joint trajectory
             self.current_joint_trajectory = joint_trajectory
@@ -1847,6 +1946,17 @@ class StandaloneDeformationController(Node):
                 self.get_logger().error('Please install pybullet: pip install pybullet')
                 return False
             
+            # Verify joint trajectory has variation (not all points the same)
+            joint_traj_array = np.array(joint_trajectory)
+            if len(joint_traj_array) > 1:
+                joint_variation = np.std(joint_traj_array, axis=0)
+                max_variation = np.max(joint_variation)
+                
+                if max_variation < 1e-4:
+                    self.get_logger().error(f'CRITICAL: Joint trajectory has no variation (max std: {max_variation:.6f})!')
+                    self.get_logger().error('All joint positions are identical - robot will not move!')
+                    return False
+            
             # Store joint trajectory
             self.current_joint_trajectory = joint_trajectory
             
@@ -1925,6 +2035,17 @@ class StandaloneDeformationController(Node):
                 if joint_trajectory is None or len(joint_trajectory) == 0:
                     self.get_logger().error('Failed to convert trajectory to joint positions')
                     return
+                
+                # Verify joint trajectory has variation (not all points the same)
+                joint_traj_array = np.array(joint_trajectory)
+                if len(joint_traj_array) > 1:
+                    joint_variation = np.std(joint_traj_array, axis=0)
+                    max_variation = np.max(joint_variation)
+                    
+                    if max_variation < 1e-4:
+                        self.get_logger().error(f'CRITICAL: Joint trajectory has no variation (max std: {max_variation:.6f})!')
+                        self.get_logger().error('All joint positions are identical - robot will not move!')
+                        return
                 
                 # Store joint trajectory
                 self.current_joint_trajectory = joint_trajectory
