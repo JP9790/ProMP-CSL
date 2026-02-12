@@ -665,13 +665,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             }
             
             // Send to Python controller if connection is available
-            // This may throw SocketException if connection is closed
+            // PrintWriter.println() doesn't throw exceptions, so connection is checked above
             forceDataOut.println(forceMsg);
             
-        } catch (java.net.SocketException e) {
-            // Connection lost - this is expected when Python disconnects
-            getLogger().debug("Socket connection lost while sending force data: " + e.getMessage());
-            // Don't log as error - this is normal when Python script stops
         } catch (Exception e) {
             // Log error but continue - force sensor might not be available in all configurations
             getLogger().debug("Error reading force sensor data: " + e.getMessage());
@@ -748,13 +744,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 externalJointTorques[6]);
             
             // Send external joint torques to Python controller
-            // This may throw SocketException if connection is closed
+            // PrintWriter.println() doesn't throw exceptions, so connection is checked above
             forceDataOut.println(jointTorqueMsg);
             
-        } catch (java.net.SocketException e) {
-            // Connection lost - this is expected when Python disconnects
-            getLogger().debug("Socket connection lost while sending joint torques: " + e.getMessage());
-            // Don't log as error - this is normal when Python script stops
         } catch (Exception e) {
             // Log error but continue - allows system to work even if Jacobian computation fails
             getLogger().debug("Error computing external joint torques: " + e.getMessage());
@@ -957,21 +949,6 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             } catch (InterruptedException e) {
                 getLogger().info("Force data thread interrupted");
                 break;
-            } catch (java.net.SocketException e) {
-                // Socket connection lost
-                consecutiveErrors++;
-                getLogger().info("Force data socket connection lost: " + e.getMessage() + 
-                              " (error " + consecutiveErrors + "/" + MAX_CONSECUTIVE_ERRORS + ")");
-                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                    getLogger().info("Too many socket errors - stopping force data thread");
-                    forceDataThreadRunning.set(false);
-                    break;
-                }
-                try {
-                    Thread.sleep(100); // Wait before retrying
-                } catch (InterruptedException ie) {
-                    break;
-                }
             } catch (Exception e) {
                 consecutiveErrors++;
                 getLogger().debug("Error in force data thread: " + e.getMessage() + 
