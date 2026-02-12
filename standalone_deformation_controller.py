@@ -167,22 +167,44 @@ class StandaloneDeformationController(Node):
             self.kuka_socket = None
     
     def _receive_complete_message(self, sock, timeout=5.0, buffer_size=8192):
-        """Receive complete message from socket"""
+        """Receive complete message from socket - robust version matching train_and_execute.py"""
         try:
+            original_timeout = sock.gettimeout()
             sock.settimeout(timeout)
             message_parts = []
+            
             while True:
-                data = sock.recv(buffer_size)
-                if not data:
+                try:
+                    data = sock.recv(buffer_size)
+                    if not data:
+                        break
+                    message_parts.append(data.decode('utf-8'))
+                    if b'\n' in data:
+                        break
+                except socket.timeout:
+                    # Timeout is expected - return what we have so far
                     break
-                message_parts.append(data.decode('utf-8'))
-                if b'\n' in data:
-                    break
-            return ''.join(message_parts)
+                except OSError as e:
+                    # Handle EAGAIN/EWOULDBLOCK (Resource temporarily unavailable)
+                    if e.errno == 11:  # EAGAIN/EWOULDBLOCK
+                        # This can happen with non-blocking sockets - just continue waiting
+                        time.sleep(0.001)  # Small sleep to avoid busy wait
+                        continue
+                    else:
+                        raise
+            
+            # Restore original timeout
+            sock.settimeout(original_timeout)
+            
+            result = ''.join(message_parts)
+            return result if result else None
+            
         except socket.timeout:
             return None
         except Exception as e:
-            self.get_logger().error(f"Error receiving message: {e}")
+            # Don't log EAGAIN errors as errors - they're expected in some cases
+            if not (isinstance(e, OSError) and e.errno == 11):
+                self.get_logger().debug(f"Error receiving message: {e}")
             return None
     
     def setup_ros_communication(self):
