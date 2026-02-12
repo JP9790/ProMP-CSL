@@ -109,8 +109,7 @@ class AIRLController(Node):
         # State
         self.is_executing = False
         self.execution_thread = None
-        self.torque_data = deque(maxlen=1000)  # External force/torque from sensor
-        self.joint_torque_data = deque(maxlen=1000)  # Joint torques for each joint (7 joints)
+        self.joint_torque_data = deque(maxlen=1000)  # Joint torques for each joint (7 joints) - for logging only
         
         # TCP communication
         self.kuka_socket = None
@@ -118,8 +117,7 @@ class AIRLController(Node):
         
         # CSV logging data structures
         self.execution_trajectory_log = []  # Track final execution trajectory (Cartesian)
-        self.joint_torque_log = []  # Track all joint torques during execution
-        self.external_torque_log = []  # Track all external torques during execution
+        self.joint_torque_log = []  # Track all joint torques during execution (for logging only)
         self.result_directory = os.path.join(os.path.expanduser('~/result'), 'airl_controller')
         
         # Thread lock for pybullet IK (pybullet is not thread-safe)
@@ -172,13 +170,14 @@ class AIRLController(Node):
                 self.get_logger().error(f'Unexpected response from KUKA: {ready}')
                 self.kuka_socket = None
             
-            # Setup server for receiving torque data
+            # Setup server for receiving joint torque data (for logging only)
+            # Note: AIRL controller doesn't use torques for trajectory updates, only for logging
             self.torque_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.torque_socket.bind(('0.0.0.0', 30003))
             self.torque_socket.listen(1)
             
-            # Start torque data thread
-            self.torque_thread = threading.Thread(target=self.receive_torque_data)
+            # Start joint torque data thread (for logging only)
+            self.torque_thread = threading.Thread(target=self.receive_joint_torque_data)
             self.torque_thread.daemon = True
             self.torque_thread.start()
             
@@ -404,20 +403,20 @@ class AIRLController(Node):
         self.stop_execution_sub = self.create_subscription(
             Bool, 'stop_execution', self.stop_execution_callback, 10)
         
-        # Subscribe to external joint torques from ROS2 topic (if iiwa_stack is available)
+        # Subscribe to joint torques from ROS2 topic (for logging only - not used for trajectory updates)
         if self.use_ros2_joint_torques:
             if HAS_IIWA_MSGS:
                 self.external_joint_torque_sub = self.create_subscription(
                     JointTorque, self.external_joint_torque_topic, 
                     self.external_joint_torque_callback, 10)
-                self.get_logger().info(f'Subscribed to external joint torques via ROS2 topic: {self.external_joint_torque_topic} (using iiwa_msgs/JointTorque)')
+                self.get_logger().info(f'Subscribed to joint torques via ROS2 topic: {self.external_joint_torque_topic} (for logging only)')
             else:
                 self.external_joint_torque_sub = self.create_subscription(
                     JointState, self.external_joint_torque_topic,
                     self.external_joint_torque_callback_jointstate, 10)
-                self.get_logger().info(f'Subscribed to external joint torques via ROS2 topic: {self.external_joint_torque_topic} (using sensor_msgs/JointState)')
+                self.get_logger().info(f'Subscribed to joint torques via ROS2 topic: {self.external_joint_torque_topic} (for logging only)')
         else:
-            self.get_logger().info('Using TCP socket for external joint torques (Java application will send JOINT_TORQUE: messages)')
+            self.get_logger().info('Using TCP socket for joint torques (for logging only - Java application will send JOINT_TORQUE: messages)')
     
     def external_joint_torque_callback(self, msg):
         """Callback for external joint torques from ROS2 topic (using iiwa_msgs/JointTorque)"""
@@ -458,11 +457,12 @@ class AIRLController(Node):
         except Exception as e:
             self.get_logger().error(f'Error processing JointState message: {e}')
     
-    def receive_torque_data(self):
-        """Receive torque data from KUKA robot via TCP socket"""
+    def receive_joint_torque_data(self):
+        """Receive joint torque data from KUKA robot via TCP socket (for logging only)
+        AIRL controller doesn't use torques for trajectory updates"""
         try:
             conn, addr = self.torque_socket.accept()
-            self.get_logger().info(f'Torque data connection from {addr}')
+            self.get_logger().info(f'Joint torque data connection from {addr}')
             
             while True:
                 data = conn.recv(2048)
@@ -473,31 +473,24 @@ class AIRLController(Node):
                 for line in lines:
                     if line.strip():
                         try:
-                            parts = line.strip().split(',')
-                            
-                            if not self.use_ros2_joint_torques and line.startswith('JOINT_TORQUE:'):
+                            # Only parse joint torque data (format: JOINT_TORQUE:timestamp,j1,j2,j3,j4,j5,j6,j7)
+                            if line.startswith('JOINT_TORQUE:'):
                                 joint_data = line.replace('JOINT_TORQUE:', '').strip()
                                 values = [float(x) for x in joint_data.split(',')]
-                                if len(values) >= 8:
+                                if len(values) >= 8:  # timestamp + 7 joints
                                     timestamp = values[0]
-                                    joint_torques = values[1:8]
+                                    joint_torques = values[1:8]  # 7 joint torques
                                     self.joint_torque_data.append({
                                         'timestamp': timestamp,
                                         'joint_torques': joint_torques
                                     })
-                            elif len(parts) >= 7:
-                                timestamp, fx, fy, fz, tx, ty, tz = map(float, parts[:7])
-                                self.torque_data.append({
-                                    'timestamp': timestamp,
-                                    'force': [fx, fy, fz],
-                                    'torque': [tx, ty, tz]
-                                })
+                            # Ignore external force/torque data - not needed for AIRL controller
                         except ValueError as e:
-                            self.get_logger().debug(f'Error parsing torque data line: {line[:50]}... Error: {e}')
+                            self.get_logger().debug(f'Error parsing joint torque data line: {line[:50]}... Error: {e}')
                             continue
                             
         except Exception as e:
-            self.get_logger().error(f'Error receiving torque data: {e}')
+            self.get_logger().error(f'Error receiving joint torque data: {e}')
     
     def load_demos(self):
         """Load demonstrations from file (matching train_and_execute.py)"""
@@ -646,11 +639,22 @@ class AIRLController(Node):
             else:
                 initial_state_normalized = initial_state
             
-            # Generate trajectory using AIRL
+            # Generate trajectory using AIRL (pass demonstrations for better generation)
+            normalized_demos = []
+            if len(self.demos) > 0:
+                # Normalize demos for trajectory generation
+                for demo in self.demos:
+                    if self.demo_min is not None and self.demo_max is not None:
+                        demo_normalized = (demo - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+                    else:
+                        demo_normalized = demo
+                    normalized_demos.append(demo_normalized)
+            
             trajectory_normalized = self.airl.generate_trajectory(
                 initial_state_normalized,
                 num_points=self.trajectory_points,
-                dt=0.01
+                dt=0.01,
+                demonstrations=normalized_demos if len(normalized_demos) > 0 else None
             )
             
             # Denormalize trajectory back to original scale
@@ -778,7 +782,6 @@ class AIRLController(Node):
         # Initialize CSV logging data structures
         self.execution_trajectory_log = []
         self.joint_torque_log = []
-        self.external_torque_log = []
         
         # Create result directory
         os.makedirs(self.result_directory, exist_ok=True)
@@ -787,10 +790,10 @@ class AIRLController(Node):
         self.get_logger().info('Starting trajectory execution...')
         self.execution_status_pub.publish(String(data='EXECUTION_STARTED'))
         
-        # Monitor torques during execution in a separate thread
-        def monitor_torques():
+        # Monitor joint torques during execution in a separate thread (for logging only)
+        def monitor_joint_torques():
             while self.is_executing:
-                # Log joint torques
+                # Log joint torques (for logging purposes only - not used for trajectory updates)
                 if len(self.joint_torque_data) > 0:
                     latest = self.joint_torque_data[-1]
                     self.joint_torque_log.append({
@@ -798,18 +801,9 @@ class AIRLController(Node):
                         'joint_torques': latest['joint_torques'].copy()
                     })
                 
-                # Log external torques
-                if len(self.torque_data) > 0:
-                    latest = self.torque_data[-1]
-                    self.external_torque_log.append({
-                        'timestamp': latest['timestamp'],
-                        'force': latest['force'].copy(),
-                        'torque': latest['torque'].copy()
-                    })
-                
                 time.sleep(0.01)  # 100 Hz
         
-        monitor_thread = threading.Thread(target=monitor_torques)
+        monitor_thread = threading.Thread(target=monitor_joint_torques)
         monitor_thread.daemon = True
         monitor_thread.start()
         
@@ -1026,18 +1020,6 @@ class AIRLController(Node):
             else:
                 self.get_logger().warn('No joint torque data to save')
             
-            # Save external torques
-            if len(self.external_torque_log) > 0:
-                external_torque_file = os.path.join(self.result_directory, f'external_torques_{timestamp}.csv')
-                with open(external_torque_file, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['timestamp_s', 'force_x_N', 'force_y_N', 'force_z_N', 'torque_x_Nm', 'torque_y_Nm', 'torque_z_Nm'])
-                    for entry in self.external_torque_log:
-                        row = [entry['timestamp']] + entry['force'] + entry['torque']
-                        writer.writerow(row)
-                self.get_logger().info(f'Saved external torques to {external_torque_file} ({len(self.external_torque_log)} samples)')
-            else:
-                self.get_logger().warn('No external torque data to save')
                 
         except Exception as e:
             self.get_logger().error(f'Error saving execution data to CSV: {e}')

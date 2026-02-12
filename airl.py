@@ -229,13 +229,21 @@ class AIRL:
         all_states = np.concatenate(all_states, axis=0)
         all_actions = np.concatenate(all_actions, axis=0)
         
+        # Store demonstrations for trajectory generation
+        self.demonstrations = demonstrations
+        
         # Simple reward learning: fit linear reward function to expert data
         # Reward = w^T * [state; action]
         sa_pairs = np.hstack([all_states, all_actions])
         
-        # Use mean expert trajectory as target
-        mean_trajectory = np.mean([demo for demo in demonstrations], axis=0)
-        target_rewards = np.ones(len(sa_pairs))  # Positive rewards for expert data
+        # Compute target rewards: higher reward for actions that follow demonstration patterns
+        # Use distance to mean action as reward signal
+        mean_action = np.mean(all_actions, axis=0)
+        action_distances = np.linalg.norm(all_actions - mean_action, axis=1)
+        # Inverse distance: closer to mean = higher reward
+        max_dist = np.max(action_distances) + 1e-10
+        target_rewards = 1.0 - (action_distances / max_dist)
+        target_rewards = np.clip(target_rewards, 0.1, 1.0)  # Keep rewards positive
         
         # Simple linear regression for reward weights
         # Minimize: ||w^T * sa - target_rewards||^2
@@ -246,9 +254,10 @@ class AIRL:
         result = minimize(objective, self.reward_weights, method='BFGS')
         self.reward_weights = result.x
         
-        logger.info('Simplified AIRL training completed')
+        logger.info(f'Simplified AIRL training completed. Reward weights shape: {self.reward_weights.shape}')
+        logger.info(f'Reward weight range: [{np.min(self.reward_weights):.4f}, {np.max(self.reward_weights):.4f}]')
     
-    def generate_trajectory(self, initial_state, num_points=100, dt=0.01):
+    def generate_trajectory(self, initial_state, num_points=100, dt=0.01, demonstrations=None):
         """
         Generate trajectory using learned reward function
         
@@ -256,6 +265,7 @@ class AIRL:
             initial_state: Initial state (state_dim,)
             num_points: Number of trajectory points
             dt: Time step
+            demonstrations: Optional list of demonstrations to guide trajectory generation
             
         Returns:
             trajectory: Generated trajectory (num_points, state_dim)
@@ -266,25 +276,84 @@ class AIRL:
         trajectory = np.zeros((num_points, self.state_dim))
         trajectory[0] = initial_state
         
+        # If demonstrations are provided, use them as a guide
+        if demonstrations is not None and len(demonstrations) > 0:
+            # Use mean demonstration trajectory as baseline
+            mean_demo = np.mean([demo for demo in demonstrations], axis=0)
+            
+            # Interpolate mean demo to match num_points
+            if len(mean_demo) != num_points:
+                from scipy.interpolate import interp1d
+                t_old = np.linspace(0, 1, len(mean_demo))
+                t_new = np.linspace(0, 1, num_points)
+                mean_demo_interp = np.zeros((num_points, self.state_dim))
+                for dim in range(self.state_dim):
+                    interp_func = interp1d(t_old, mean_demo[:, dim], kind='cubic', fill_value='extrapolate')
+                    mean_demo_interp[:, dim] = interp_func(t_new)
+                mean_demo = mean_demo_interp
+            
+            # Start from initial state, then blend with mean demo
+            # Use reward function to adjust the trajectory
+            trajectory = mean_demo.copy()
+            trajectory[0] = initial_state
+            
+            # Refine trajectory using reward function (gradient ascent on reward)
+            for iteration in range(5):  # Multiple refinement passes
+                for i in range(1, num_points):
+                    current_state = trajectory[i-1]
+                    target_state = trajectory[i]
+                    
+                    # Compute action as difference
+                    base_action = (target_state - current_state) / dt
+                    
+                    # Try variations around base action to maximize reward
+                    best_action = base_action.copy()
+                    best_reward = self.compute_reward(current_state, base_action)
+                    
+                    # Try gradient-based improvement
+                    for _ in range(20):
+                        # Add small perturbation
+                        perturbation = np.random.randn(self.action_dim) * 0.05
+                        candidate_action = base_action + perturbation
+                        
+                        # Ensure action doesn't cause too large state changes
+                        max_action_norm = np.linalg.norm(base_action) * 2.0
+                        if np.linalg.norm(candidate_action) > max_action_norm:
+                            candidate_action = candidate_action / np.linalg.norm(candidate_action) * max_action_norm
+                        
+                        reward = self.compute_reward(current_state, candidate_action)
+                        if reward > best_reward:
+                            best_reward = reward
+                            best_action = candidate_action
+                    
+                    # Update trajectory point
+                    trajectory[i] = current_state + best_action * dt
+            
+            return trajectory
+        
+        # Fallback: generate trajectory from scratch using reward function
         current_state = initial_state.copy()
         
         for i in range(1, num_points):
-            # Simple policy: greedy action selection based on reward
-            # In full AIRL, this would use a learned policy network
+            # Use larger action search space
             best_action = np.zeros(self.action_dim)
             best_reward = float('-inf')
             
-            # Try different actions and select the one with highest reward
-            # Simplified: use small random perturbations
-            for _ in range(10):
-                action = np.random.randn(self.action_dim) * 0.1
+            # Try more actions with larger scale
+            for _ in range(50):
+                # Scale action based on progress through trajectory
+                progress = i / num_points
+                action_scale = 0.5 * (1.0 - progress * 0.5)  # Start larger, decrease over time
+                action = np.random.randn(self.action_dim) * action_scale
+                
                 reward = self.compute_reward(current_state, action)
                 if reward > best_reward:
                     best_reward = reward
                     best_action = action
             
-            # Update state: state_{t+1} = state_t + action * dt
-            next_state = current_state + best_action * dt
+            # Use larger dt for more meaningful movement
+            effective_dt = dt * 10.0  # Scale up time step
+            next_state = current_state + best_action * effective_dt
             trajectory[i] = next_state
             current_state = next_state
         
