@@ -733,51 +733,20 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
      * - Rows 3-5: Angular velocity Jacobian (orientation)
      * - Columns 0-6: Joints 1-7
      * 
-     * Uses KUKA RoboticsAPI's built-in Jacobian computation.
-     * KUKA RoboticsAPI provides: robot.getJacobian(frame, referenceFrame)
+     * Note: KUKA RoboticsAPI LBR class does not provide a direct getJacobian() method.
+     * We use analytical computation based on DH parameters and forward kinematics.
      */
     private double[][] computeJacobian(JointPosition joints) {
         double[][] jacobian = new double[6][7];
         
         try {
-            ObjectFrame flangeFrame = robot.getFlange();
-            ObjectFrame baseFrame = robot.getRootFrame();
-            
-            // KUKA RoboticsAPI method: getJacobian(flangeFrame, baseFrame)
-            // Returns a 6x7 matrix representing the geometric Jacobian
-            // Note: Method name may be getJacobian() or computeJacobian() depending on API version
-            // getFlange() and getRootFrame() return ObjectFrame, which is compatible with getJacobian()
-            try {
-                // Try KUKA RoboticsAPI's built-in Jacobian computation
-                // Common method signatures:
-                // - robot.getJacobian(flangeFrame, baseFrame)
-                // - robot.computeJacobian(joints, flangeFrame)
-                
-                // Attempt to get Jacobian from API
-                // If this method doesn't exist, it will throw an exception and use fallback
-                com.kuka.roboticsAPI.geometricModel.Jacobian jacobianObj = robot.getJacobian(flangeFrame, baseFrame);
-                
-                // Extract Jacobian matrix from Jacobian object
-                // KUKA RoboticsAPI Jacobian typically provides getMatrix() or similar
-                // Adjust based on your API version
-                for (int i = 0; i < 6; i++) {
-                    for (int j = 0; j < 7; j++) {
-                        // Extract element (i, j) from Jacobian matrix
-                        // Method name may vary: getElement(i, j), getValue(i, j), etc.
-                        jacobian[i][j] = jacobianObj.getElement(i, j);
-                    }
-                }
-                
-                getLogger().debug("Computed Jacobian using KUKA RoboticsAPI");
-                
-            } catch (NoSuchMethodError | Exception e) {
-                // Fallback: Compute analytically if API method doesn't exist
-                getLogger().info("KUKA RoboticsAPI getJacobian() not available, using analytical computation");
-                jacobian = computeJacobianAnalytical(joints);
-            }
+            // KUKA RoboticsAPI LBR class does not have getJacobian() method
+            // Use analytical computation based on DH parameters
+            getLogger().debug("Computing Jacobian analytically using DH parameters");
+            jacobian = computeJacobianAnalytical(joints);
             
         } catch (Exception e) {
-            // If all methods fail, return zero matrix (Python will receive zeros)
+            // If computation fails, return zero matrix (Python will receive zeros)
             getLogger().warn("Could not compute Jacobian: " + e.getMessage() + ", using zero matrix");
             for (int i = 0; i < 6; i++) {
                 for (int j = 0; j < 7; j++) {
