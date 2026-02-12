@@ -1082,8 +1082,61 @@ class StandaloneDeformationController(Node):
                             else:
                                 # High energy: use stepwise EM update
                                 self.get_logger().info(f'Energy {energy:.4f} >= threshold {self.energy_threshold} - Triggering stepwise EM update')
-                                em_learner = StepwiseEMLearner(self.promp)
-                                new_traj = em_learner.update_and_generate(trajectory, latest)
+                                
+                                # Deform trajectory first
+                                human_input = np.array(latest['force'] + latest['torque'])
+                                deformed_traj, _, deformation_energy = self.deformer.deform(human_input)
+                                
+                                if deformed_traj is not None:
+                                    # Normalize deformed trajectory
+                                    if self.demo_min is not None and self.demo_max is not None:
+                                        deformed_demo_normalized = (np.array(deformed_traj) - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+                                    else:
+                                        deformed_demo_normalized = np.array(deformed_traj)
+                                    
+                                    # Initialize StepwiseEMLearner if needed
+                                    if self.stepwise_em_learner is None:
+                                        self.stepwise_em_learner = StepwiseEMLearner(
+                                            num_basis=self.num_basis,
+                                            sigma_noise=self.sigma_noise,
+                                            delta_N=0.1
+                                        )
+                                        # Initialize with first demo if available
+                                        if len(self.demos) > 0:
+                                            if self.demo_min is not None:
+                                                first_demo_normalized = (np.array(self.demos[0]) - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+                                            else:
+                                                first_demo_normalized = np.array(self.demos[0])
+                                            self.stepwise_em_learner.initialize_from_first_demo(first_demo_normalized)
+                                    
+                                    # Update StepwiseEMLearner with deformed trajectory
+                                    self.stepwise_em_learner.stepwise_em_update(deformed_demo_normalized)
+                                    
+                                    # Update ProMP parameters from StepwiseEMLearner
+                                    if self.stepwise_em_learner.mean_weights is not None:
+                                        self.promp.mean_weights = self.stepwise_em_learner.mean_weights.copy()
+                                        self.promp.cov_weights = self.stepwise_em_learner.cov_weights.copy()
+                                        self.promp.basis_centers = self.stepwise_em_learner.basis_centers.copy()
+                                        self.promp.basis_width = self.stepwise_em_learner.basis_width
+                                    
+                                    # Generate new trajectory from updated ProMP
+                                    num_points = len(trajectory)
+                                    new_traj_normalized = self.promp.generate_trajectory(num_points=num_points)
+                                    
+                                    # Denormalize
+                                    if self.demo_min is not None and self.demo_max is not None:
+                                        new_traj = new_traj_normalized * (self.demo_max - self.demo_min) + self.demo_min
+                                        new_traj = np.clip(new_traj, self.demo_min, self.demo_max)
+                                    else:
+                                        new_traj = new_traj_normalized
+                                    
+                                    # Add deformed trajectory as new demo
+                                    self.demos.append(deformed_traj)
+                                    self.get_logger().info(f'Deformed trajectory added as demonstration #{len(self.demos)}')
+                                else:
+                                    self.get_logger().warn('Deformation failed, keeping current trajectory')
+                                    new_traj = trajectory
+                                
                                 self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
                         else:
                             # No ProMP available - use trajectory deformer
