@@ -928,16 +928,17 @@ class StandaloneDeformationController(Node):
                 # Use the method that tracks progress via point_count
                 success = self.send_trajectory_to_kuka_with_interrupt_and_progress(
                     traj, trajectory_executing, point_count, point_count_lock)
-                if success:
-                    self.get_logger().info('Initial trajectory execution completed')
+                with point_count_lock:
+                    executed_points = point_count[0]
+                
+                if success and executed_points > 0:
+                    self.get_logger().info(f'Initial trajectory execution completed ({executed_points} points)')
+                elif executed_points == 0:
+                    self.get_logger().error('Trajectory execution failed: 0 points executed!')
+                    # Don't mark as finished if no points were executed
+                    return
                 else:
-                    self.get_logger().warn('Initial trajectory execution had errors, but continuing monitoring...')
-                    # Even if there were errors, continue monitoring - some points may have executed
-                    # Set point_count to indicate we've started (even if partially)
-                    with point_count_lock:
-                        if point_count[0] == 0:
-                            # No points executed, set to 1 to allow monitoring to continue
-                            point_count[0] = 1
+                    self.get_logger().warn(f'Initial trajectory execution had errors ({executed_points} points executed), but continuing monitoring...')
             except Exception as e:
                 self.get_logger().error(f'Error in trajectory execution: {e}')
                 import traceback
@@ -947,13 +948,20 @@ class StandaloneDeformationController(Node):
                     if point_count[0] == 0:
                         point_count[0] = 1
             finally:
-                # Only clear if trajectory actually finished completely
+                # Only clear if trajectory actually finished completely AND at least some points were executed
                 # If interrupted, keep it set so monitoring can detect it
+                with point_count_lock:
+                    executed_points = point_count[0]
+                
                 if not trajectory_executing.is_set():
                     # Trajectory was interrupted, don't clear
                     pass
-                else:
+                elif executed_points > 0:
+                    # Only mark as finished if at least some points were executed
                     trajectory_executing.clear()  # Mark as finished
+                else:
+                    # 0 points executed - don't mark as finished, keep monitoring
+                    self.get_logger().warn('Not marking trajectory as finished: 0 points executed')
         
         # Start trajectory execution in background thread
         execution_thread = threading.Thread(target=execute_trajectory_with_monitoring, args=(trajectory,))
@@ -969,20 +977,31 @@ class StandaloneDeformationController(Node):
         
         # Track if trajectory has completed
         trajectory_completed = False
-        completion_check_timeout = 2.0  # Wait 2 seconds after completion before exiting
+        completion_check_timeout = 10.0  # Wait 10 seconds after completion before exiting (robot may still be moving)
         completion_time = None
         
         while self.is_executing:
             # Check if trajectory execution thread is still alive
             if execution_thread is not None and not execution_thread.is_alive():
                 # Thread finished (either completed or errored)
-                # Check if trajectory_executing flag was cleared
+                # Check how many points were executed
+                with point_count_lock:
+                    executed_points = point_count[0]
+                
+                # Only mark as completed if at least some points were executed
+                if executed_points == 0:
+                    self.get_logger().error('Trajectory execution failed: 0 points executed!')
+                    self.get_logger().error('Stopping execution - no valid trajectory was executed')
+                    self.is_executing = False
+                    break
+                
+                # Check if trajectory_executing flag was cleared (only cleared if points were executed)
                 if not trajectory_executing.is_set():
-                    # Trajectory finished
+                    # Trajectory finished successfully
                     if not trajectory_completed:
                         trajectory_completed = True
                         completion_time = time.time()
-                        self.get_logger().info('Trajectory execution completed')
+                        self.get_logger().info(f'Trajectory execution completed ({executed_points} points)')
                         self.execution_status_pub.publish(String(data='TRAJECTORY_COMPLETED'))
                     # Check if enough time has passed since completion
                     if completion_time is not None and (time.time() - completion_time) > completion_check_timeout:
@@ -994,11 +1013,22 @@ class StandaloneDeformationController(Node):
             
             # Check if trajectory is still executing
             if not trajectory_executing.is_set() and execution_thread is not None:
-                # Trajectory finished - check if we should exit
+                # Check how many points were executed
+                with point_count_lock:
+                    executed_points = point_count[0]
+                
+                # Only mark as completed if at least some points were executed
+                if executed_points == 0:
+                    self.get_logger().error('Trajectory execution failed: 0 points executed!')
+                    self.get_logger().error('Stopping execution - no valid trajectory was executed')
+                    self.is_executing = False
+                    break
+                
+                # Trajectory finished successfully - check if we should exit
                 if not trajectory_completed:
                     trajectory_completed = True
                     completion_time = time.time()
-                    self.get_logger().info('Trajectory execution finished')
+                    self.get_logger().info(f'Trajectory execution finished ({executed_points} points)')
                     self.execution_status_pub.publish(String(data='TRAJECTORY_COMPLETED'))
                 # Wait a bit after completion before exiting
                 if completion_time is not None and (time.time() - completion_time) > completion_check_timeout:
@@ -1763,7 +1793,7 @@ class StandaloneDeformationController(Node):
     def send_trajectory_to_kuka_with_interrupt_and_progress(self, trajectory, interrupt_event, 
                                                            point_count, point_count_lock):
         """Send trajectory to KUKA robot and monitor execution, can be interrupted
-        Also tracks execution progress via point_count"""
+        Also tracks execution progress via point_count and logs executed trajectory points"""
         if self.kuka_socket is None:
             self.get_logger().error('No connection to KUKA robot')
             return False
@@ -1815,24 +1845,38 @@ class StandaloneDeformationController(Node):
                 response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed ({point_count[0]} points)')
-                    complete = True
-                    return True
+                    with point_count_lock:
+                        executed_points = point_count[0]
+                    if executed_points > 0:
+                        self.get_logger().info(f'Trajectory execution completed ({executed_points} points)')
+                        complete = True
+                        return True
+                    else:
+                        self.get_logger().error('Trajectory execution completed but 0 points were executed!')
+                        return False
                 elif "ERROR" in response:
                     error_count += 1
-                    self.get_logger().warn(f'Point execution error (skipping): {response}')
+                    self.get_logger().debug(f'Point execution error (skipping): {response}')
                 elif "POINT_COMPLETE" in response:
                     with point_count_lock:
                         point_count[0] += 1
-                    if point_count[0] % 50 == 0:  # Reduced logging frequency
-                        self.get_logger().debug(f'Progress: {point_count[0]}/{len(joint_trajectory)} points completed')
+                        current_point_idx = point_count[0]
+                    
+                    # Log executed trajectory point (Cartesian)
+                    if current_point_idx <= len(trajectory):
+                        self.execution_trajectory_log.append(trajectory[current_point_idx - 1].tolist())
+                    
+                    if current_point_idx % 50 == 0:  # Reduced logging frequency
+                        self.get_logger().debug(f'Progress: {current_point_idx}/{len(joint_trajectory)} points completed')
             
             if not complete and not interrupt_event.is_set():
                 self.get_logger().debug('Trajectory execution interrupted')
                 return False
             elif not complete:
-                self.get_logger().debug(f'Trajectory execution ended. Points: {point_count[0]}, Errors: {error_count}')
-                return point_count[0] > 0
+                with point_count_lock:
+                    executed_points = point_count[0]
+                self.get_logger().debug(f'Trajectory execution ended. Points: {executed_points}, Errors: {error_count}')
+                return executed_points > 0
             
             return True
             
