@@ -129,6 +129,9 @@ class ProMPIncController(Node):
         self.external_torque_log = []  # Track all external torques during execution
         self.result_directory = os.path.join(os.path.expanduser('~/result'), 'promp_inc_controller')
         
+        # Thread lock for pybullet IK (pybullet is not thread-safe)
+        self.pybullet_lock = threading.Lock()
+        
         # Setup communication
         self.setup_communication()
         
@@ -230,15 +233,26 @@ class ProMPIncController(Node):
     def cartesian_to_joint_python(self, cartesian_poses):
         """Convert Cartesian poses to joint positions using pybullet IK solver
         Matches train_and_execute.py implementation"""
-        try:
-            import pybullet as p
-            import pybullet_data
-            
-            self.get_logger().info('Using pybullet for IK computation (most reliable for KUKA)')
-            
-            # Initialize pybullet in DIRECT mode (no GUI, faster)
-            physics_client = p.connect(p.DIRECT)
-            p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        # Use lock to ensure thread-safe access to pybullet
+        with self.pybullet_lock:
+            try:
+                import pybullet as p
+                import pybullet_data
+                
+                self.get_logger().info('Using pybullet for IK computation (most reliable for KUKA)')
+                
+                # Check if pybullet is already connected
+                try:
+                    conn_info = p.getConnectionInfo()
+                    if conn_info is not None:
+                        self.get_logger().info('Pybullet already connected, disconnecting first...')
+                        p.disconnect()
+                except:
+                    pass  # Not connected, proceed
+                
+                # Initialize pybullet in DIRECT mode (no GUI, faster)
+                physics_client = p.connect(p.DIRECT)
+                p.setAdditionalSearchPath(pybullet_data.getDataPath())
             
             # Try to load KUKA LBR iiwa URDF from common locations
             robot_id = None
@@ -266,20 +280,41 @@ class ProMPIncController(Node):
                 p.disconnect()
                 return None
             
-            # Get number of joints
-            num_joints = p.getNumJoints(robot_id)
-            end_effector_link = num_joints - 1
-            
-            joint_positions = []
-            failed_count = 0
-            
-            # Initial joint configuration (seed for IK)
-            initial_joints = [0.0, 0.7854, 0.0, -1.3962, 0.0, -0.6109, 0.0]
-            current_joints = initial_joints.copy()
-            
-            self.get_logger().info(f'Computing IK for {len(cartesian_poses)} poses using pybullet...')
-            
-            for i, pose in enumerate(cartesian_poses):
+                # Verify connection before proceeding
+                try:
+                    conn_info = p.getConnectionInfo()
+                    if conn_info is None:
+                        self.get_logger().error('Pybullet connection failed')
+                        p.disconnect()
+                        return None
+                except:
+                    self.get_logger().error('Pybullet connection verification failed')
+                    p.disconnect()
+                    return None
+                
+                # Get number of joints
+                num_joints = p.getNumJoints(robot_id)
+                end_effector_link = num_joints - 1
+                
+                joint_positions = []
+                failed_count = 0
+                
+                # Initial joint configuration (seed for IK)
+                initial_joints = [0.0, 0.7854, 0.0, -1.3962, 0.0, -0.6109, 0.0]
+                current_joints = initial_joints.copy()
+                
+                self.get_logger().info(f'Computing IK for {len(cartesian_poses)} poses using pybullet...')
+                
+                for i, pose in enumerate(cartesian_poses):
+                    # Verify connection before each IK call
+                    try:
+                        conn_info = p.getConnectionInfo()
+                        if conn_info is None:
+                            self.get_logger().error(f'Pybullet connection lost at point {i}')
+                            break
+                    except:
+                        self.get_logger().error(f'Pybullet connection check failed at point {i}')
+                        break
                 x, y, z, alpha, beta, gamma = pose
                 target_pos = [x, y, z]
                 target_orn = p.getQuaternionFromEuler([alpha, beta, gamma])
@@ -332,26 +367,30 @@ class ProMPIncController(Node):
                     else:
                         joint_positions.append(initial_joints)
                 
-                if (i + 1) % 10 == 0:
-                    self.get_logger().info(f'Pybullet IK progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
-            
-            p.disconnect()
-            
-            if failed_count == 0:
-                self.get_logger().info(f'Successfully computed IK for all {len(cartesian_poses)} poses using pybullet')
-            else:
-                self.get_logger().warn(f'IK computed with {failed_count} failures (used previous/initial positions)')
-            
-            return np.array(joint_positions)
-            
-        except ImportError:
-            self.get_logger().error('pybullet not installed. Install with: pip install pybullet')
-            return None
-        except Exception as e:
-            self.get_logger().error(f'pybullet IK failed: {e}')
-            import traceback
-            self.get_logger().error(traceback.format_exc())
-            return None
+                    if (i + 1) % 10 == 0:
+                        self.get_logger().info(f'Pybullet IK progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
+                
+                p.disconnect()
+                
+                if failed_count == 0:
+                    self.get_logger().info(f'Successfully computed IK for all {len(cartesian_poses)} poses using pybullet')
+                else:
+                    self.get_logger().warn(f'IK computed with {failed_count} failures (used previous/initial positions)')
+                
+                return np.array(joint_positions)
+                
+            except ImportError:
+                self.get_logger().error('pybullet not installed. Install with: pip install pybullet')
+                return None
+            except Exception as e:
+                self.get_logger().error(f'pybullet IK failed: {e}')
+                import traceback
+                self.get_logger().error(traceback.format_exc())
+                try:
+                    p.disconnect()
+                except:
+                    pass
+                return None
     
     def _create_simple_kuka_model(self, p):
         """Create a simple 7-DOF KUKA LBR iiwa model for IK"""
@@ -837,6 +876,7 @@ class ProMPIncController(Node):
                     # Trigger trajectory deformation and incremental learning
                     self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds threshold '
                                           f'({self.joint_torque_threshold:.3f} Nm) - triggering deformation and incremental learning')
+                    self.get_logger().info(f'Joint torques: {joint_torques}')
                     
                     # Get current execution progress to restart from this point
                     with point_count_lock:
@@ -856,10 +896,17 @@ class ProMPIncController(Node):
                             'torque': latest_torque['torque'].copy()
                         })
                         human_input = np.array(latest_torque['force'] + latest_torque['torque'])
+                        self.get_logger().info(f'Using external force/torque for deformation: force={latest_torque["force"]}, torque={latest_torque["torque"]}')
                     else:
                         # Fallback: use joint torques converted to Cartesian (approximate)
-                        # Sum joint torques as proxy for external force
-                        human_input = np.array([max_joint_torque, max_joint_torque, max_joint_torque, 0.0, 0.0, 0.0])
+                        # Use joint torques as proxy for external force
+                        # Map joint torques to Cartesian forces (simplified: use max torque magnitude)
+                        force_magnitude = max_joint_torque * 10.0  # Scale factor (Nm to N approximate)
+                        human_input = np.array([force_magnitude, force_magnitude, force_magnitude, 
+                                               max_joint_torque, max_joint_torque, max_joint_torque])
+                        self.get_logger().warn(f'No external torque data available, using joint torques as proxy: {human_input}')
+                    
+                    self.get_logger().info(f'Human input for deformation: {human_input}')
                     
                     # Trigger trajectory deformation and incremental learning
                     self.handle_trajectory_deformation_and_incremental_learning(
@@ -867,6 +914,10 @@ class ProMPIncController(Node):
                         execute_trajectory_with_monitoring, point_count, point_count_lock,
                         current_idx, t_current)
                     last_deformation_time = current_time
+                    
+                    # Update trajectory reference after deformation
+                    trajectory = self.current_trajectory.copy()
+                    num_points = trajectory.shape[0]
             
             time.sleep(dt)
         
@@ -924,14 +975,21 @@ class ProMPIncController(Node):
             self.get_logger().info('Starting trajectory deformation and incremental learning...')
             
             # Step 1: Deform current trajectory
+            self.get_logger().info(f'Deforming trajectory with human_input: {human_input}')
             self.deformer.set_trajectory(current_trajectory)
             deformed_traj, original_traj, deformation_energy = self.deformer.deform(human_input)
             
             if deformed_traj is None:
-                self.get_logger().error('Trajectory deformation failed')
+                self.get_logger().error('Trajectory deformation failed - deformed_traj is None')
                 return
             
-            self.get_logger().info(f'Trajectory deformed successfully. Energy: {deformation_energy:.4f}')
+            # Check if deformation actually changed the trajectory
+            if np.allclose(deformed_traj, original_traj, atol=1e-6):
+                self.get_logger().warn('Trajectory deformation produced no change - deformation may be too small')
+            else:
+                max_diff = np.max(np.abs(deformed_traj - original_traj))
+                self.get_logger().info(f'Trajectory deformation successful. Max change: {max_diff:.6f}, Energy: {deformation_energy:.4f}')
+            
             self.deformation_status_pub.publish(String(data=f'DEFORMATION_COMPLETED:{deformation_energy:.4f}'))
             
             # Step 2: Normalize deformed trajectory to match demo format

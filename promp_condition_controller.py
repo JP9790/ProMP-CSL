@@ -736,13 +736,16 @@ class ProMPConditionController(Node):
                 success = self.send_trajectory_to_kuka_with_interrupt_and_progress(
                     traj, trajectory_executing, point_count, point_count_lock)
                 if success:
-                    self.get_logger().info('Trajectory execution completed')
+                    self.get_logger().info('Trajectory execution completed successfully')
                 else:
-                    self.get_logger().warn('Trajectory execution had errors')
+                    self.get_logger().warn('Trajectory execution had errors or was interrupted')
             except Exception as e:
                 self.get_logger().error(f'Error in trajectory execution: {e}')
+                import traceback
+                self.get_logger().error(traceback.format_exc())
             finally:
                 trajectory_executing.clear()  # Mark as finished
+                self.get_logger().info('Trajectory execution thread finished')
         
         # Start trajectory execution in background thread
         execution_thread = threading.Thread(target=execute_trajectory_with_monitoring, args=(trajectory,))
@@ -753,11 +756,27 @@ class ProMPConditionController(Node):
         # Step 2: Monitor torque during execution
         last_conditioning_time = 0
         conditioning_cooldown = 0.3  # Minimum time between conditioning (seconds)
+        trajectory_completed = False
         
         while self.is_executing:
             # Check if trajectory is still executing
-            if not trajectory_executing.is_set() and execution_thread is not None:
-                # Trajectory finished, wait a bit and check if we should continue
+            if not trajectory_executing.is_set():
+                # Trajectory finished or was interrupted
+                if execution_thread is not None:
+                    # Wait for thread to finish
+                    execution_thread.join(timeout=2.0)
+                    if execution_thread.is_alive():
+                        self.get_logger().warn('Execution thread did not finish in time')
+                    else:
+                        trajectory_completed = True
+                        self.get_logger().info('Trajectory execution thread completed')
+                
+                # Exit monitoring loop after trajectory completes
+                if trajectory_completed:
+                    self.get_logger().info('Trajectory execution completed, exiting monitoring loop')
+                    break
+                
+                # If interrupted but not completed, continue monitoring (might restart)
                 time.sleep(0.1)
                 continue
             
@@ -811,16 +830,28 @@ class ProMPConditionController(Node):
             
             time.sleep(dt)
         
-        # Wait for execution thread to finish
-        if execution_thread is not None:
+        # Wait for execution thread to finish (if not already done)
+        if execution_thread is not None and execution_thread.is_alive():
+            self.get_logger().info('Waiting for execution thread to finish...')
             execution_thread.join(timeout=5.0)
+            if execution_thread.is_alive():
+                self.get_logger().warn('Execution thread did not finish in time')
         
         self.is_executing = False
-        self.get_logger().info('Trajectory execution finished')
+        self.get_logger().info('Trajectory execution finished - saving CSV files...')
         self.execution_status_pub.publish(String(data='EXECUTION_STOPPED'))
+        
+        # Ensure all trajectory points are logged before saving
+        with point_count_lock:
+            final_idx = point_count[0]
+            if final_idx < len(trajectory) and len(self.execution_trajectory_log) < final_idx:
+                # Log any remaining trajectory points
+                remaining_points = trajectory[len(self.execution_trajectory_log):final_idx]
+                self.execution_trajectory_log.extend(remaining_points.tolist())
         
         # Save CSV files
         self.save_execution_data_to_csv()
+        self.get_logger().info('CSV files saved successfully')
     
     def stop_execution(self):
         """Stop trajectory execution"""
@@ -1031,9 +1062,20 @@ class ProMPConditionController(Node):
                 response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count[0]}, Errors (skipped): {error_count}')
+                    with point_count_lock:
+                        final_count = point_count[0]
+                    self.get_logger().info(f'Trajectory execution completed. Points: {final_count}, Errors (skipped): {error_count}')
                     if skipped_points:
                         self.get_logger().warn(f'Skipped points: {skipped_points[:10]}' + ('...' if len(skipped_points) > 10 else ''))
+                    
+                    # Ensure all trajectory points are logged
+                    if final_count < len(trajectory):
+                        remaining = trajectory[final_count:]
+                        self.execution_trajectory_log.extend(remaining.tolist())
+                    elif len(self.execution_trajectory_log) < len(trajectory):
+                        # Log complete trajectory if not all points were logged individually
+                        self.execution_trajectory_log = trajectory.tolist()
+                    
                     complete = True
                     return True
                 elif "ERROR" in response:
@@ -1174,8 +1216,15 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info('Interrupted by user')
+        # Stop execution if running
+        if node.is_executing:
+            node.stop_execution()
         node.save_promp()  # Save ProMP state before shutting down
     finally:
+        # Ensure CSV files are saved before shutdown
+        if node.is_executing:
+            node.stop_execution()
+        node.save_execution_data_to_csv()
         node.destroy_node()
         rclpy.shutdown()
 
