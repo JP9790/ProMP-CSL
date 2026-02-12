@@ -46,8 +46,10 @@ class StandaloneDeformationController(Node):
         self.declare_parameter('trajectory_points', 100)
         self.declare_parameter('train_on_startup', True)
         self.declare_parameter('execute_after_training', True)
+        # Note: Using TCP socket for joint torques (Java sends JOINT_TORQUE: messages)
+        # ROS2 topics are not used - set use_ros2_joint_torques=False
         self.declare_parameter('external_joint_torque_topic', '/iiwa/jointExternalTorque')
-        self.declare_parameter('use_ros2_joint_torques', False)
+        self.declare_parameter('use_ros2_joint_torques', False)  # Always False - use TCP socket
         
         # Get parameters
         self.kuka_ip = self.get_parameter('kuka_ip').value
@@ -216,11 +218,16 @@ class StandaloneDeformationController(Node):
         self.start_execution_sub = self.create_subscription(Bool, 'start_deformation_execution', self.start_execution_callback, 10)
         self.stop_execution_sub = self.create_subscription(Bool, 'stop_deformation_execution', self.stop_execution_callback, 10)
         
+        # Note: Not using ROS2 topics for joint torques - using TCP socket instead
+        # Joint torques are received via TCP socket from Java application (JOINT_TORQUE: messages)
         if self.use_ros2_joint_torques:
+            self.get_logger().warn('use_ros2_joint_torques=True but ROS2 topics not used - using TCP socket instead')
             if HAS_IIWA_MSGS:
                 self.external_joint_torque_sub = self.create_subscription(JointTorque, self.external_joint_torque_topic, self.external_joint_torque_callback, 10)
             else:
                 self.external_joint_torque_sub = self.create_subscription(JointState, self.external_joint_torque_topic, self.external_joint_torque_callback_jointstate, 10)
+        else:
+            self.get_logger().info('Using TCP socket for joint torques (Java sends JOINT_TORQUE: messages on port 30003)')
     
     def cartesian_to_joint_python(self, cartesian_poses):
         """Convert Cartesian poses to joint positions using pybullet IK"""
@@ -563,7 +570,8 @@ class StandaloneDeformationController(Node):
                         try:
                             parts = line.strip().split(',')
                             
-                            if not self.use_ros2_joint_torques and line.startswith('JOINT_TORQUE:'):
+                            # Parse JOINT_TORQUE messages from Java application (primary method - no ROS2 topics)
+                            if line.startswith('JOINT_TORQUE:'):
                                 joint_data = line.replace('JOINT_TORQUE:', '').strip()
                                 values = [float(x) for x in joint_data.split(',')]
                                 if len(values) >= 8:
