@@ -192,8 +192,15 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     getLogger().warn("Unknown command: " + line);
                 }
             }
+            
+            // Python client disconnected - stop force data thread
+            getLogger().info("Python client disconnected - stopping force data thread");
+            forceDataThreadRunning.set(false);
+            
         } catch (IOException e) {
-            getLogger().error("IO Exception: " + e.getMessage());
+            getLogger().info("IO Exception (Python client likely disconnected): " + e.getMessage());
+            // Stop force data thread when connection is lost
+            forceDataThreadRunning.set(false);
         }
     }
 
@@ -638,6 +645,11 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 return;
             }
             
+            // Check connection before reading force data
+            if (forceDataSocket == null || forceDataSocket.isClosed() || forceDataOut == null) {
+                return; // No connection, skip sending
+            }
+            
             // Get real external force/torque data from KUKA LBR IIWA force sensor
             ForceSensorData forceData = robot.getExternalForceTorque(robot.getFlange());
             
@@ -647,14 +659,22 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 forceData.getForce().getX(), forceData.getForce().getY(), forceData.getForce().getZ(),
                 forceData.getTorque().getX(), forceData.getTorque().getY(), forceData.getTorque().getZ());
             
-            // Send to Python controller if connection is available
-            if (forceDataOut != null) {
-                forceDataOut.println(forceMsg);
+            // Check connection again before sending (connection might have closed during data reading)
+            if (forceDataSocket == null || forceDataSocket.isClosed() || forceDataOut == null) {
+                return; // Connection lost, skip sending
             }
             
+            // Send to Python controller if connection is available
+            // This may throw SocketException if connection is closed
+            forceDataOut.println(forceMsg);
+            
+        } catch (java.net.SocketException e) {
+            // Connection lost - this is expected when Python disconnects
+            getLogger().debug("Socket connection lost while sending force data: " + e.getMessage());
+            // Don't log as error - this is normal when Python script stops
         } catch (Exception e) {
             // Log error but continue - force sensor might not be available in all configurations
-            getLogger().info("Error reading force sensor data: " + e.getMessage());
+            getLogger().debug("Error reading force sensor data: " + e.getMessage());
         }
     }
     
@@ -674,7 +694,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
      */
     private void sendExternalJointTorques() {
         try {
-            if (robot == null || forceDataOut == null) {
+            // Check connection before computing Jacobian (expensive operation)
+            if (robot == null || forceDataOut == null || forceDataSocket == null || forceDataSocket.isClosed()) {
                 return;
             }
             
@@ -693,8 +714,17 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             JointPosition currentJoints = robot.getCurrentJointPosition();
             
             // Compute Jacobian matrix (6x7) for current joint configuration
-            // KUKA RoboticsAPI provides getJacobian() method
+            // Only compute if connection is still valid
+            if (forceDataSocket == null || forceDataSocket.isClosed() || forceDataOut == null) {
+                return; // Connection lost, skip computation
+            }
+            
             double[][] jacobian = computeJacobian(currentJoints);
+            
+            // Check connection again before sending (connection might have closed during computation)
+            if (forceDataSocket == null || forceDataSocket.isClosed() || forceDataOut == null) {
+                return; // Connection lost during computation
+            }
             
             // Compute external joint torques using Jacobian transpose: tau = J^T * F
             double[] externalJointTorques = new double[7];
@@ -718,8 +748,13 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 externalJointTorques[6]);
             
             // Send external joint torques to Python controller
+            // This may throw SocketException if connection is closed
             forceDataOut.println(jointTorqueMsg);
             
+        } catch (java.net.SocketException e) {
+            // Connection lost - this is expected when Python disconnects
+            getLogger().debug("Socket connection lost while sending joint torques: " + e.getMessage());
+            // Don't log as error - this is normal when Python script stops
         } catch (Exception e) {
             // Log error but continue - allows system to work even if Jacobian computation fails
             getLogger().debug("Error computing external joint torques: " + e.getMessage());
@@ -885,23 +920,69 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
      * Continuous force data sender thread - sends force data at 100Hz
      * This runs independently to provide real-time force feedback
      * Now also sends external joint torques for monitoring
+     * Stops automatically when Python connection is lost
      */
     private void continuousForceDataSender() {
+        int consecutiveErrors = 0;
+        final int MAX_CONSECUTIVE_ERRORS = 10; // Stop after 10 consecutive errors (1 second at 100Hz)
+        
         while (forceDataThreadRunning.get()) {
             try {
+                // Check if socket connection is still valid before computing Jacobian
+                if (forceDataSocket == null || forceDataSocket.isClosed() || forceDataOut == null) {
+                    getLogger().info("Force data socket connection lost - stopping force data thread");
+                    forceDataThreadRunning.set(false);
+                    break;
+                }
+                
+                // Check if socket is still connected (may throw exception if disconnected)
+                if (!forceDataSocket.isConnected()) {
+                    getLogger().info("Force data socket disconnected - stopping force data thread");
+                    forceDataThreadRunning.set(false);
+                    break;
+                }
+                
                 // Send external force/torque from flange sensor
                 sendForceData();
                 
                 // Send external joint torques (torques on each joint due to external forces)
-                sendExternalJointTorques();
+                // Only compute if connection is valid
+                if (forceDataSocket != null && !forceDataSocket.isClosed() && forceDataOut != null) {
+                    sendExternalJointTorques();
+                }
                 
+                consecutiveErrors = 0; // Reset error counter on success
                 Thread.sleep(10); // 100 Hz - matches demo recording frequency
+                
             } catch (InterruptedException e) {
                 getLogger().info("Force data thread interrupted");
                 break;
+            } catch (java.net.SocketException e) {
+                // Socket connection lost
+                consecutiveErrors++;
+                getLogger().info("Force data socket connection lost: " + e.getMessage() + 
+                              " (error " + consecutiveErrors + "/" + MAX_CONSECUTIVE_ERRORS + ")");
+                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                    getLogger().info("Too many socket errors - stopping force data thread");
+                    forceDataThreadRunning.set(false);
+                    break;
+                }
+                try {
+                    Thread.sleep(100); // Wait before retrying
+                } catch (InterruptedException ie) {
+                    break;
+                }
             } catch (Exception e) {
-                getLogger().error("Error in force data thread: " + e.getMessage());
-                // Continue running even if there's an error
+                consecutiveErrors++;
+                getLogger().debug("Error in force data thread: " + e.getMessage() + 
+                               " (error " + consecutiveErrors + "/" + MAX_CONSECUTIVE_ERRORS + ")");
+                // Stop if too many consecutive errors (likely connection lost)
+                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                    getLogger().info("Too many errors - stopping force data thread");
+                    forceDataThreadRunning.set(false);
+                    break;
+                }
+                // Continue running but slow down on error
                 try {
                     Thread.sleep(100); // Slow down on error
                 } catch (InterruptedException ie) {
@@ -909,6 +990,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 }
             }
         }
+        
+        getLogger().info("Force data thread stopped");
     }
 
     private void stopCurrentMotion() {
