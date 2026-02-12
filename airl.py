@@ -149,6 +149,9 @@ class AIRL:
     
     def _train_torch(self, demonstrations, num_iterations, batch_size, logger):
         """Train AIRL using PyTorch"""
+        # Store demonstrations for trajectory generation
+        self.demonstrations = demonstrations
+        
         # Create networks
         self.reward_function = self._create_reward_network()
         self.discriminator = self._create_discriminator()
@@ -265,7 +268,7 @@ class AIRL:
             initial_state: Initial state (state_dim,)
             num_points: Number of trajectory points
             dt: Time step
-            demonstrations: Optional list of demonstrations to guide trajectory generation
+            demonstrations: Optional list of demonstrations to guide trajectory generation (if None, uses self.demonstrations from training)
             
         Returns:
             trajectory: Generated trajectory (num_points, state_dim)
@@ -276,7 +279,11 @@ class AIRL:
         trajectory = np.zeros((num_points, self.state_dim))
         trajectory[0] = initial_state
         
-        # If demonstrations are provided, use them as a guide
+        # Use provided demonstrations or fall back to stored demonstrations from training
+        if demonstrations is None:
+            demonstrations = getattr(self, 'demonstrations', None)
+        
+        # If demonstrations are available, use them as a guide
         if demonstrations is not None and len(demonstrations) > 0:
             # Use mean demonstration trajectory as baseline
             mean_demo = np.mean([demo for demo in demonstrations], axis=0)

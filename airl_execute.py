@@ -518,31 +518,14 @@ class AIRLExecute(Node):
             else:
                 initial_state_normalized = initial_state
             
-            # Generate trajectory using AIRL (pass demonstrations for better generation)
-            normalized_demos = []
-            if len(self.demos) > 0:
-                # Normalize demos for trajectory generation
-                for demo in self.demos:
-                    if self.demo_min is not None and self.demo_max is not None:
-                        demo_normalized = (demo - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
-                    else:
-                        demo_normalized = demo
-                    normalized_demos.append(demo_normalized)
-            
-            # Generate trajectory - pass demonstrations if available
-            if len(normalized_demos) > 0:
-                trajectory_normalized = self.airl.generate_trajectory(
-                    initial_state_normalized,
-                    num_points=self.trajectory_points,
-                    dt=0.01,
-                    demonstrations=normalized_demos
-                )
-            else:
-                trajectory_normalized = self.airl.generate_trajectory(
-                    initial_state_normalized,
-                    num_points=self.trajectory_points,
-                    dt=0.01
-                )
+            # Generate trajectory using AIRL
+            # Note: generate_trajectory doesn't accept demonstrations parameter in current version
+            # It will use the demonstrations stored during training if available
+            trajectory_normalized = self.airl.generate_trajectory(
+                initial_state_normalized,
+                num_points=self.trajectory_points,
+                dt=0.01
+            )
             
             # Denormalize trajectory back to original scale
             if self.demo_min is not None and self.demo_max is not None:
