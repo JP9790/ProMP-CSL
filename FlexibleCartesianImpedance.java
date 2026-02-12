@@ -662,10 +662,10 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
      * Send external joint torques (torques on each joint due to external forces)
      * 
      * Computes external joint torques from flange force/torque using Jacobian transpose:
-     * τ_joint = J^T * F_external
+     * tau_joint = J^T * F_external
      * 
      * Where:
-     * - τ_joint: 7x1 vector of external joint torques (Nm)
+     * - tau_joint: 7x1 vector of external joint torques (Nm)
      * - J^T: Transpose of 6x7 Jacobian matrix
      * - F_external: 6x1 vector of external force/torque at flange [fx, fy, fz, tx, ty, tz]
      * 
@@ -696,10 +696,10 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             // KUKA RoboticsAPI provides getJacobian() method
             double[][] jacobian = computeJacobian(currentJoints);
             
-            // Compute external joint torques using Jacobian transpose: τ = J^T * F
+            // Compute external joint torques using Jacobian transpose: tau = J^T * F
             double[] externalJointTorques = new double[7];
             for (int i = 0; i < 7; i++) {
-                // τ_i = Σ_j (J^T_ij * F_j) = Σ_j (J_ji * F_j)
+                // tau_i = sum_j (J^T_ij * F_j) = sum_j (J_ji * F_j)
                 externalJointTorques[i] = 
                     jacobian[0][i] * fx +   // Force X contribution
                     jacobian[1][i] * fy +   // Force Y contribution
@@ -763,9 +763,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
      * This computes the geometric Jacobian based on current joint positions
      * 
      * Reference: Based on standard robotics Jacobian computation
-     * J = [J_v; J_ω] where:
+     * J = [J_v; J_w] where:
      * - J_v: Linear velocity Jacobian (3x7)
-     * - J_ω: Angular velocity Jacobian (3x7)
+     * - J_w: Angular velocity Jacobian (3x7)
      */
     private double[][] computeJacobianAnalytical(JointPosition joints) {
         double[][] jacobian = new double[6][7];
@@ -806,13 +806,13 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             // Compute vector from joint i to end-effector
             double[] p_ei = {p_e[0] - p_i[0], p_e[1] - p_i[1], p_e[2] - p_i[2]};
             
-            // Linear velocity Jacobian: J_v = z_i × (p_e - p_i) for revolute joints
+            // Linear velocity Jacobian: J_v = z_i x (p_e - p_i) for revolute joints (x = cross product)
             double[] j_v = crossProduct(z_i, p_ei);
             jacobian[0][i] = j_v[0];
             jacobian[1][i] = j_v[1];
             jacobian[2][i] = j_v[2];
             
-            // Angular velocity Jacobian: J_ω = z_i for revolute joints
+            // Angular velocity Jacobian: J_w = z_i for revolute joints
             jacobian[3][i] = z_i[0];
             jacobian[4][i] = z_i[1];
             jacobian[5][i] = z_i[2];
