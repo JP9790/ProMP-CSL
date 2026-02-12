@@ -380,8 +380,8 @@ class StandaloneDeformationController(Node):
                         else:
                             joint_positions.append(initial_joints)
                     
-                    if (i + 1) % 10 == 0:
-                        self.get_logger().info(f'Pybullet IK progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
+                    if (i + 1) % 50 == 0:  # Reduced logging frequency
+                        self.get_logger().debug(f'Pybullet IK progress: {i+1}/{len(cartesian_poses)} ({failed_count} failed)')
                 
                 # Disconnect pybullet before releasing lock
                 try:
@@ -390,7 +390,7 @@ class StandaloneDeformationController(Node):
                     pass  # Ignore disconnect errors
                 
                 if failed_count == 0:
-                    self.get_logger().info(f'Successfully computed IK for all {len(cartesian_poses)} poses using pybullet')
+                    self.get_logger().debug(f'Successfully computed IK for all {len(cartesian_poses)} poses')
                 else:
                     self.get_logger().warn(f'IK computed with {failed_count} failures (used previous/initial positions)')
                 
@@ -803,9 +803,9 @@ class StandaloneDeformationController(Node):
                 'joint_torques': joint_torques  # [tau1, tau2, ..., tau7] in Nm
             })
             
-            # Log periodically
-            if len(self.joint_torque_data) % 100 == 0:
-                self.get_logger().debug(f'Received external joint torques via ROS2: {joint_torques}')
+            # Log periodically (reduced frequency)
+            if len(self.joint_torque_data) % 1000 == 0:
+                self.get_logger().debug(f'Received external joint torques via ROS2')
             
         except Exception as e:
             self.get_logger().error(f'Error processing JointState message: {e}')
@@ -905,11 +905,11 @@ class StandaloneDeformationController(Node):
         
         # Create result directory
         os.makedirs(self.result_directory, exist_ok=True)
-        self.get_logger().info(f'CSV logging enabled. Results will be saved to: {self.result_directory}')
+        self.get_logger().info(f'CSV logging enabled: {self.result_directory}')
         
         # Step 1: Execute the initial trajectory first (like train_and_execute.py)
         # This ensures the robot actually starts moving
-        self.get_logger().info('Starting trajectory execution...')
+        self.get_logger().info(f'Starting trajectory execution ({num_points} points)...')
         self.execution_status_pub.publish(String(data='EXECUTION_STARTED'))
         
         # Track execution progress (shared between threads)
@@ -959,7 +959,7 @@ class StandaloneDeformationController(Node):
         execution_thread = threading.Thread(target=execute_trajectory_with_monitoring, args=(trajectory,))
         execution_thread.daemon = True
         execution_thread.start()
-        self.get_logger().info('Trajectory execution started, beginning torque monitoring...')
+        self.get_logger().debug('Trajectory execution started, monitoring torques...')
         
         # Step 2: Monitor torque during execution
         last_deformation_time = 0
@@ -967,26 +967,43 @@ class StandaloneDeformationController(Node):
         last_conditioning_time = 0
         conditioning_cooldown = 0.3  # Minimum time between conditioning (seconds)
         
+        # Track if trajectory has completed
+        trajectory_completed = False
+        completion_check_timeout = 2.0  # Wait 2 seconds after completion before exiting
+        completion_time = None
+        
         while self.is_executing:
             # Check if trajectory execution thread is still alive
             if execution_thread is not None and not execution_thread.is_alive():
                 # Thread finished (either completed or errored)
                 # Check if trajectory_executing flag was cleared
                 if not trajectory_executing.is_set():
-                    # Trajectory finished or was interrupted
-                    # Continue monitoring for a bit to allow for any final torque data
-                    self.get_logger().info('Trajectory execution thread finished, continuing monitoring...')
-                    # Don't break - continue monitoring loop
+                    # Trajectory finished
+                    if not trajectory_completed:
+                        trajectory_completed = True
+                        completion_time = time.time()
+                        self.get_logger().info('Trajectory execution completed')
+                        self.execution_status_pub.publish(String(data='TRAJECTORY_COMPLETED'))
+                    # Check if enough time has passed since completion
+                    if completion_time is not None and (time.time() - completion_time) > completion_check_timeout:
+                        self.get_logger().info('Trajectory completed, exiting monitoring loop')
+                        break
                 else:
                     # Thread died but flag is still set - something went wrong
-                    self.get_logger().warn('Trajectory execution thread died unexpectedly, but continuing monitoring...')
+                    self.get_logger().warn('Trajectory execution thread died unexpectedly')
             
             # Check if trajectory is still executing
             if not trajectory_executing.is_set() and execution_thread is not None:
-                # Trajectory finished or was interrupted, but continue monitoring
-                # This allows the system to continue monitoring torques even after trajectory completes
-                # or if there were errors
-                pass
+                # Trajectory finished - check if we should exit
+                if not trajectory_completed:
+                    trajectory_completed = True
+                    completion_time = time.time()
+                    self.get_logger().info('Trajectory execution finished')
+                    self.execution_status_pub.publish(String(data='TRAJECTORY_COMPLETED'))
+                # Wait a bit after completion before exiting
+                if completion_time is not None and (time.time() - completion_time) > completion_check_timeout:
+                    self.get_logger().info('Exiting monitoring loop after trajectory completion')
+                    break
             
             # Monitor joint torques during execution and check thresholds
             if len(self.joint_torque_data) > 0:
@@ -1000,12 +1017,9 @@ class StandaloneDeformationController(Node):
                     'joint_torques': joint_torques.copy()
                 })
                 
-                # Log joint torques periodically (every 50 samples)
-                if len(self.joint_torque_data) % 50 == 0:
-                    self.get_logger().info(f'Joint torques: J1={joint_torques[0]:.2f}, J2={joint_torques[1]:.2f}, '
-                                          f'J3={joint_torques[2]:.2f}, J4={joint_torques[3]:.2f}, '
-                                          f'J5={joint_torques[4]:.2f}, J6={joint_torques[5]:.2f}, '
-                                          f'J7={joint_torques[6]:.2f} Nm (max={max_joint_torque:.2f} Nm)')
+                # Log joint torques periodically (every 500 samples, reduced frequency)
+                if len(self.joint_torque_data) % 500 == 0:
+                    self.get_logger().debug(f'Joint torques: max={max_joint_torque:.2f} Nm')
                 
                 # Check joint torque thresholds for ProMP conditioning
                 current_time = time.time()
@@ -1014,8 +1028,7 @@ class StandaloneDeformationController(Node):
                     (current_time - last_conditioning_time) > conditioning_cooldown):
                     
                     # Small to medium torque: Trigger ProMP conditioning at current time t
-                    self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds small threshold '
-                                          f'({self.joint_torque_threshold_small:.3f} Nm) - triggering ProMP conditioning')
+                    self.get_logger().info(f'ProMP conditioning triggered: torque={max_joint_torque:.3f} Nm (threshold={self.joint_torque_threshold_small:.3f} Nm)')
                     
                     # Get current execution progress
                     with point_count_lock:
@@ -1040,8 +1053,7 @@ class StandaloneDeformationController(Node):
                     # Large torque: Trigger trajectory deformation and incremental learning
                     current_time = time.time()
                     if (current_time - last_conditioning_time) > conditioning_cooldown:
-                        self.get_logger().info(f'Joint torque {max_joint_torque:.3f} Nm exceeds big threshold '
-                                              f'({self.joint_torque_threshold_big:.3f} Nm) - triggering trajectory deformation')
+                        self.get_logger().info(f'Trajectory deformation triggered: torque={max_joint_torque:.3f} Nm (threshold={self.joint_torque_threshold_big:.3f} Nm)')
                         
                         # Get current execution progress to restart from this point
                         with point_count_lock:
@@ -1089,7 +1101,7 @@ class StandaloneDeformationController(Node):
                     
                     # Compute deformation energy
                     energy = np.linalg.norm(latest['force']) + np.linalg.norm(latest['torque'])
-                    self.get_logger().info(f'Deformation detected! Energy: {energy:.4f}, Force: {max_force:.2f}N, Torque: {max_torque:.2f}Nm')
+                    self.get_logger().info(f'Deformation detected: Energy={energy:.4f}, Force={max_force:.2f}N, Torque={max_torque:.2f}Nm')
                     self.deformation_status_pub.publish(String(data='DEFORMATION_DETECTED'))
                     
                     # Interrupt current trajectory execution
@@ -1249,6 +1261,9 @@ class StandaloneDeformationController(Node):
             
             time.sleep(dt)
         
+        # Exit loop - trajectory completed or execution stopped
+        self.get_logger().info('Exiting execution loop')
+        
         # Wait for execution thread to finish
         if execution_thread is not None:
             execution_thread.join(timeout=5.0)
@@ -1257,8 +1272,10 @@ class StandaloneDeformationController(Node):
         self.get_logger().info('Trajectory execution finished')
         self.execution_status_pub.publish(String(data='EXECUTION_STOPPED'))
         
-        # Save CSV files
+        # Save CSV files before exiting
+        self.get_logger().info('Saving execution data to CSV files...')
         self.save_execution_data_to_csv()
+        self.get_logger().info('CSV files saved successfully')
     
     def get_current_robot_pose(self):
         """Get current robot pose from KUKA"""
@@ -1686,7 +1703,7 @@ class StandaloneDeformationController(Node):
                 return False
             
             # Convert Cartesian to joint positions using pybullet IK (matches train_and_execute.py)
-            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
+            self.get_logger().debug('Converting Cartesian trajectory to joint positions...')
             joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
             
             if joint_trajectory is None or len(joint_trajectory) == 0:
@@ -1703,8 +1720,7 @@ class StandaloneDeformationController(Node):
             ])
             
             command = f"JOINT_TRAJECTORY:{trajectory_str}\n"
-            self.get_logger().info(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
-            self.get_logger().info('Using joint positions avoids workspace errors - all points should be reachable')
+            self.get_logger().debug(f'Sending joint trajectory to KUKA ({len(joint_trajectory)} points)...')
             self.kuka_socket.sendall(command.encode('utf-8'))
             
             # Wait for completion using robust message receiving
@@ -1721,19 +1737,21 @@ class StandaloneDeformationController(Node):
                 response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count}, Errors (skipped): {error_count}')
+                    self.get_logger().info(f'Trajectory execution completed ({point_count} points)')
                     complete = True
                     return True
                 elif "ERROR" in response:
                     error_count += 1
-                    self.get_logger().warn(f'Point execution error (skipping): {response}')
+                    self.get_logger().debug(f'Point execution error (skipping): {response}')
                 elif "POINT_COMPLETE" in response:
                     point_count += 1
-                    if point_count % 10 == 0:
-                        self.get_logger().info(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
+                    if point_count % 50 == 0:  # Reduced logging frequency
+                        self.get_logger().debug(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
+                    if point_count % 50 == 0:  # Reduced logging frequency
+                        self.get_logger().debug(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
             
             if not complete:
-                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors: {error_count}')
+                self.get_logger().debug(f'Trajectory execution ended. Points: {point_count}, Errors: {error_count}')
                 return point_count > 0  # Return True if some progress made
             
         except Exception as e:
@@ -1758,7 +1776,7 @@ class StandaloneDeformationController(Node):
                 return False
             
             # Convert Cartesian to joint positions using pybullet IK
-            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
+            self.get_logger().debug('Converting Cartesian trajectory to joint positions...')
             joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
             
             if joint_trajectory is None or len(joint_trajectory) == 0:
@@ -1790,14 +1808,14 @@ class StandaloneDeformationController(Node):
                 if not response:
                     # Timeout - check if we should continue
                     if not interrupt_event.is_set():
-                        self.get_logger().info('Trajectory execution interrupted by conditioning request')
+                        self.get_logger().debug('Trajectory execution interrupted by conditioning request')
                         return False
                     continue
                 
                 response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count[0]}, Errors (skipped): {error_count}')
+                    self.get_logger().info(f'Trajectory execution completed ({point_count[0]} points)')
                     complete = True
                     return True
                 elif "ERROR" in response:
@@ -1806,14 +1824,14 @@ class StandaloneDeformationController(Node):
                 elif "POINT_COMPLETE" in response:
                     with point_count_lock:
                         point_count[0] += 1
-                    if point_count[0] % 10 == 0:
-                        self.get_logger().info(f'Progress: {point_count[0]}/{len(joint_trajectory)} points completed')
+                    if point_count[0] % 50 == 0:  # Reduced logging frequency
+                        self.get_logger().debug(f'Progress: {point_count[0]}/{len(joint_trajectory)} points completed')
             
             if not complete and not interrupt_event.is_set():
-                self.get_logger().info('Trajectory execution interrupted')
+                self.get_logger().debug('Trajectory execution interrupted')
                 return False
             elif not complete:
-                self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count[0]}, Errors: {error_count}')
+                self.get_logger().debug(f'Trajectory execution ended. Points: {point_count[0]}, Errors: {error_count}')
                 return point_count[0] > 0
             
             return True
@@ -1839,7 +1857,7 @@ class StandaloneDeformationController(Node):
                 return False
             
             # Convert Cartesian to joint positions using pybullet IK
-            self.get_logger().info('Converting Cartesian trajectory to joint positions using pybullet IK...')
+            self.get_logger().debug('Converting Cartesian trajectory to joint positions...')
             joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
             
             if joint_trajectory is None or len(joint_trajectory) == 0:
@@ -1870,23 +1888,23 @@ class StandaloneDeformationController(Node):
                 if not response:
                     # Timeout - check if we should continue
                     if not interrupt_event.is_set():
-                        self.get_logger().info('Trajectory execution interrupted by deformation request')
+                        self.get_logger().debug('Trajectory execution interrupted by deformation request')
                         return False
                     continue
                 
                 response = response.strip()
                 
                 if "TRAJECTORY_COMPLETE" in response:
-                    self.get_logger().info(f'Trajectory execution completed. Points: {point_count}, Errors (skipped): {error_count}')
+                    self.get_logger().info(f'Trajectory execution completed ({point_count} points)')
                     complete = True
                     return True
                 elif "ERROR" in response:
                     error_count += 1
-                    self.get_logger().warn(f'Point execution error (skipping): {response}')
+                    self.get_logger().debug(f'Point execution error (skipping): {response}')
                 elif "POINT_COMPLETE" in response:
                     point_count += 1
-                    if point_count % 10 == 0:
-                        self.get_logger().info(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
+                    if point_count % 50 == 0:  # Reduced logging frequency
+                        self.get_logger().debug(f'Progress: {point_count}/{len(joint_trajectory)} points completed')
             
             if not complete and not interrupt_event.is_set():
                 self.get_logger().info('Trajectory execution interrupted')
@@ -1919,7 +1937,7 @@ class StandaloneDeformationController(Node):
                     return
                 
                 # Convert Cartesian to joint positions using pybullet IK
-                self.get_logger().info('Converting Cartesian trajectory to joint positions (async)...')
+                self.get_logger().debug('Converting Cartesian trajectory to joint positions (async)...')
                 joint_trajectory = self.cartesian_to_joint_via_java(trajectory)
                 
                 if joint_trajectory is None or len(joint_trajectory) == 0:
