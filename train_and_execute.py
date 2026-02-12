@@ -11,6 +11,10 @@ import os
 from .promp import ProMP
 import argparse
 import math
+import csv
+from datetime import datetime
+from collections import deque
+import threading
 
 class TrainAndExecute(Node):
     def __init__(self):
@@ -70,9 +74,23 @@ class TrainAndExecute(Node):
         
         # TCP communication
         self.kuka_socket = None
+        self.torque_socket = None
+        
+        # CSV logging data structures
+        self.execution_trajectory_log = []  # Track final execution trajectory (Cartesian)
+        self.joint_torque_log = []  # Track all joint torques during execution
+        self.external_torque_log = []  # Track all external torques during execution
+        self.result_directory = os.path.join(os.path.expanduser('~/result'), 'train_and_execute')
+        
+        # Torque data storage
+        self.torque_data = deque(maxlen=1000)  # External force/torque from sensor
+        self.joint_torque_data = deque(maxlen=1000)  # Joint torques for each joint (7 joints)
         
         # Setup communication
         self.setup_kuka_communication()
+        
+        # Setup torque data receiving (if Java app sends it)
+        self.setup_torque_data_receiving()
         
         # Load demonstrations
         self.load_demos()
@@ -96,6 +114,66 @@ class TrainAndExecute(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to connect to KUKA: {e}')
             self.kuka_socket = None
+    
+    def setup_torque_data_receiving(self):
+        """Setup server for receiving torque data from Java application"""
+        try:
+            # Setup server for receiving torque data (Java sends to port 30003)
+            self.torque_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.torque_socket.bind(('0.0.0.0', 30003))
+            self.torque_socket.listen(1)
+            
+            # Start torque data thread
+            self.torque_thread = threading.Thread(target=self.receive_torque_data)
+            self.torque_thread.daemon = True
+            self.torque_thread.start()
+            self.get_logger().info('Torque data receiving server started on port 30003')
+        except Exception as e:
+            self.get_logger().warn(f'Failed to setup torque data receiving: {e}')
+            self.torque_socket = None
+    
+    def receive_torque_data(self):
+        """Receive torque data from KUKA robot via TCP socket"""
+        try:
+            conn, addr = self.torque_socket.accept()
+            self.get_logger().info(f'Torque data connection from {addr}')
+            
+            while True:
+                data = conn.recv(2048)
+                if not data:
+                    break
+                    
+                lines = data.decode('utf-8').split('\n')
+                for line in lines:
+                    if line.strip():
+                        try:
+                            parts = line.strip().split(',')
+                            
+                            # Parse joint torque data from TCP (format: JOINT_TORQUE:timestamp,j1,j2,j3,j4,j5,j6,j7)
+                            if line.startswith('JOINT_TORQUE:'):
+                                joint_data = line.replace('JOINT_TORQUE:', '').strip()
+                                values = [float(x) for x in joint_data.split(',')]
+                                if len(values) >= 8:  # timestamp + 7 joints
+                                    timestamp = values[0]
+                                    joint_torques = values[1:8]  # 7 joint torques
+                                    self.joint_torque_data.append({
+                                        'timestamp': timestamp,
+                                        'joint_torques': joint_torques
+                                    })
+                            elif len(parts) >= 7:
+                                # Parse external force/torque data (format: timestamp,fx,fy,fz,tx,ty,tz)
+                                timestamp, fx, fy, fz, tx, ty, tz = map(float, parts[:7])
+                                self.torque_data.append({
+                                    'timestamp': timestamp,
+                                    'force': [fx, fy, fz],
+                                    'torque': [tx, ty, tz]
+                                })
+                        except ValueError as e:
+                            self.get_logger().debug(f'Error parsing torque data line: {line[:50]}... Error: {e}')
+                            continue
+                            
+        except Exception as e:
+            self.get_logger().error(f'Error receiving torque data: {e}')
     
     def cartesian_to_joint_python(self, cartesian_poses):
         """Convert Cartesian poses to joint positions using pybullet IK solver
@@ -728,6 +806,15 @@ class TrainAndExecute(Node):
             self.get_logger().info('Using joint positions avoids workspace errors - all points should be reachable')
             self.kuka_socket.sendall(command.encode('utf-8'))
             
+            # Initialize CSV logging
+            self.execution_trajectory_log = []
+            self.joint_torque_log = []
+            self.external_torque_log = []
+            
+            # Create result directory
+            os.makedirs(self.result_directory, exist_ok=True)
+            self.get_logger().info(f'CSV logging enabled. Results will be saved to: {self.result_directory}')
+            
             # Wait for completion - handle fragmented responses and skip errors
             complete = False
             point_count = 0
@@ -747,6 +834,9 @@ class TrainAndExecute(Node):
                     if skipped_points:
                         self.get_logger().warn(f'Skipped points: {skipped_points[:10]}' + ('...' if len(skipped_points) > 10 else ''))
                     complete = True
+                    
+                    # Save CSV files after completion
+                    self.save_execution_data_to_csv()
                     return True
                 elif "ERROR" in response:
                     error_count += 1
@@ -758,23 +848,109 @@ class TrainAndExecute(Node):
                     # Don't return False, just log and continue
                 elif "POINT_COMPLETE" in response:
                     point_count += 1
+                    
+                    # Log executed trajectory point
+                    if point_count <= len(self.learned_trajectory):
+                        self.execution_trajectory_log.append(self.learned_trajectory[point_count - 1].tolist())
+                    
+                    # Log joint torques if available
+                    if len(self.joint_torque_data) > 0:
+                        latest_joint = self.joint_torque_data[-1]
+                        self.joint_torque_log.append({
+                            'timestamp': latest_joint['timestamp'],
+                            'joint_torques': latest_joint['joint_torques'].copy()
+                        })
+                    
+                    # Log external torques if available
+                    if len(self.torque_data) > 0:
+                        latest_torque = self.torque_data[-1]
+                        self.external_torque_log.append({
+                            'timestamp': latest_torque['timestamp'],
+                            'force': latest_torque['force'].copy(),
+                            'torque': latest_torque['torque'].copy()
+                        })
+                    
                     if point_count % 10 == 0:  # Log every 10 points
                         self.get_logger().info(f'Progress: {point_count}/{len(self.learned_trajectory)} points completed (errors skipped: {error_count})')
             
             if not complete:
                 self.get_logger().warn(f'Trajectory execution did not complete normally. Points: {point_count}, Errors (skipped): {error_count}')
+                
+                # Log partial trajectory if execution was interrupted
+                if point_count < len(self.learned_trajectory):
+                    self.execution_trajectory_log.extend(self.learned_trajectory[:point_count].tolist())
+                
+                # Save CSV files even if execution didn't complete
+                self.save_execution_data_to_csv()
+                
                 # Return True if we made some progress, False if nothing worked
                 if point_count > 0:
                     self.get_logger().info(f'Partial execution completed with {point_count} successful points')
                     return True
                 else:
                     return False
+            else:
+                # Log complete trajectory
+                self.execution_trajectory_log = self.learned_trajectory.tolist()
             
         except Exception as e:
             self.get_logger().error(f'Error sending trajectory to KUKA: {e}')
             import traceback
             self.get_logger().error(traceback.format_exc())
+            # Save CSV files even on error
+            self.save_execution_data_to_csv()
             return False
+    
+    def save_execution_data_to_csv(self):
+        """Save execution trajectory, joint torques, and external torques to CSV files"""
+        try:
+            # Create result directory if it doesn't exist
+            os.makedirs(self.result_directory, exist_ok=True)
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # Save execution trajectory
+            if len(self.execution_trajectory_log) > 0:
+                traj_file = os.path.join(self.result_directory, f'execution_trajectory_{timestamp}.csv')
+                with open(traj_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['x_m', 'y_m', 'z_m', 'alpha_rad', 'beta_rad', 'gamma_rad'])
+                    for point in self.execution_trajectory_log:
+                        writer.writerow(point)
+                self.get_logger().info(f'Saved execution trajectory to {traj_file} ({len(self.execution_trajectory_log)} points)')
+            else:
+                self.get_logger().warn('No execution trajectory data to save')
+            
+            # Save joint torques
+            if len(self.joint_torque_log) > 0:
+                joint_torque_file = os.path.join(self.result_directory, f'joint_torques_{timestamp}.csv')
+                with open(joint_torque_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['timestamp_s', 'joint1_Nm', 'joint2_Nm', 'joint3_Nm', 'joint4_Nm', 'joint5_Nm', 'joint6_Nm', 'joint7_Nm'])
+                    for entry in self.joint_torque_log:
+                        row = [entry['timestamp']] + entry['joint_torques']
+                        writer.writerow(row)
+                self.get_logger().info(f'Saved joint torques to {joint_torque_file} ({len(self.joint_torque_log)} samples)')
+            else:
+                self.get_logger().warn('No joint torque data to save')
+            
+            # Save external torques
+            if len(self.external_torque_log) > 0:
+                external_torque_file = os.path.join(self.result_directory, f'external_torques_{timestamp}.csv')
+                with open(external_torque_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['timestamp_s', 'force_x_N', 'force_y_N', 'force_z_N', 'torque_x_Nm', 'torque_y_Nm', 'torque_z_Nm'])
+                    for entry in self.external_torque_log:
+                        row = [entry['timestamp']] + entry['force'] + entry['torque']
+                        writer.writerow(row)
+                self.get_logger().info(f'Saved external torques to {external_torque_file} ({len(self.external_torque_log)} samples)')
+            else:
+                self.get_logger().warn('No external torque data to save')
+                
+        except Exception as e:
+            self.get_logger().error(f'Error saving execution data to CSV: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
     
     def save_learned_trajectory(self, filename=None):
         """Save learned trajectory to ~/newfoldername"""
