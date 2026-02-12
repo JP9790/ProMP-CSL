@@ -8,6 +8,7 @@ import com.kuka.roboticsAPI.motionModel.PositionHold;
 import com.kuka.roboticsAPI.motionModel.controlModeModel.CartesianImpedanceControlMode;
 import com.kuka.roboticsAPI.motionModel.controlModeModel.JointImpedanceControlMode;
 import com.kuka.roboticsAPI.geometricModel.Frame;
+import com.kuka.roboticsAPI.geometricModel.ObjectFrame;
 import com.kuka.roboticsAPI.motionModel.PTP;
 import com.kuka.roboticsAPI.motionModel.LIN;
 import com.kuka.roboticsAPI.sensorModel.ForceSensorData;
@@ -739,12 +740,13 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         double[][] jacobian = new double[6][7];
         
         try {
-            Frame flangeFrame = robot.getFlange();
-            Frame baseFrame = robot.getRootFrame();
+            ObjectFrame flangeFrame = robot.getFlange();
+            ObjectFrame baseFrame = robot.getRootFrame();
             
             // KUKA RoboticsAPI method: getJacobian(flangeFrame, baseFrame)
             // Returns a 6x7 matrix representing the geometric Jacobian
             // Note: Method name may be getJacobian() or computeJacobian() depending on API version
+            // getFlange() and getRootFrame() return ObjectFrame, which is compatible with getJacobian()
             try {
                 // Try KUKA RoboticsAPI's built-in Jacobian computation
                 // Common method signatures:
