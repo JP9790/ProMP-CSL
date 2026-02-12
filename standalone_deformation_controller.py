@@ -1303,7 +1303,7 @@ class StandaloneDeformationController(Node):
         self.execution_status_pub.publish(String(data='EXECUTION_STOPPED'))
         
         # Save CSV files before exiting
-        self.get_logger().info('Saving execution data to CSV files...')
+        self.get_logger().info(f'Saving execution data to CSV files... (trajectory log: {len(self.execution_trajectory_log)} points, joint torque log: {len(self.joint_torque_log)} samples, external torque log: {len(self.external_torque_log)} samples)')
         self.save_execution_data_to_csv()
         self.get_logger().info('CSV files saved successfully')
     
@@ -1848,7 +1848,7 @@ class StandaloneDeformationController(Node):
                     with point_count_lock:
                         executed_points = point_count[0]
                     if executed_points > 0:
-                        self.get_logger().info(f'Trajectory execution completed ({executed_points} points)')
+                        self.get_logger().info(f'Trajectory execution completed ({executed_points} points, logged: {len(self.execution_trajectory_log)} trajectory points)')
                         complete = True
                         return True
                     else:
@@ -1862,11 +1862,17 @@ class StandaloneDeformationController(Node):
                         point_count[0] += 1
                         current_point_idx = point_count[0]
                     
-                    # Log executed trajectory point (Cartesian)
+                    # Log executed trajectory point (Cartesian) - use planned trajectory
+                    # Note: We log the planned trajectory point, which should match what was executed
                     if current_point_idx <= len(trajectory):
                         self.execution_trajectory_log.append(trajectory[current_point_idx - 1].tolist())
+                    else:
+                        self.get_logger().warn(f'Point index {current_point_idx} exceeds trajectory length {len(trajectory)}')
                     
-                    if current_point_idx % 50 == 0:  # Reduced logging frequency
+                    # Debug logging every 10 points to verify logging is working
+                    if current_point_idx % 10 == 0:
+                        self.get_logger().info(f'Progress: {current_point_idx}/{len(joint_trajectory)} points completed, logged {len(self.execution_trajectory_log)} trajectory points')
+                    elif current_point_idx % 50 == 0:  # Reduced logging frequency
                         self.get_logger().debug(f'Progress: {current_point_idx}/{len(joint_trajectory)} points completed')
             
             if not complete and not interrupt_event.is_set():
