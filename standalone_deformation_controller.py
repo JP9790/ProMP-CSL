@@ -1137,6 +1137,27 @@ class StandaloneDeformationController(Node):
         # Save CSV files
         self.save_execution_data_to_csv()
     
+    def get_current_robot_pose(self):
+        """Get current robot pose from KUKA"""
+        if self.kuka_socket is None:
+            return None
+        
+        try:
+            self.kuka_socket.sendall(b"GET_POSE\n")
+            self.kuka_socket.settimeout(1.0)
+            pose_response = self._receive_complete_message(self.kuka_socket, timeout=1.0)
+            self.kuka_socket.settimeout(None)
+            
+            if pose_response and pose_response.startswith("POSE:"):
+                pose_str = pose_response.split("POSE:")[1].strip()
+                current_pose = np.array([float(x) for x in pose_str.split(",")])
+                return current_pose
+            else:
+                return None
+        except Exception as e:
+            self.get_logger().warn(f'Could not get current pose: {e}')
+            return None
+    
     def stop_execution(self):
         """Stop trajectory execution"""
         self.is_executing = False
@@ -1244,6 +1265,116 @@ class StandaloneDeformationController(Node):
         # For now, just log the high deformation
         # You can implement additional logic here (e.g., stop execution, switch to manual mode, etc.)
         self.deformation_status_pub.publish(String(data=f'HIGH_DEFORMATION:{energy:.4f}'))
+    
+    def trigger_promp_conditioning_at_time(self, t_current, current_pose, current_trajectory,
+                                          trajectory_executing, execution_thread,
+                                          execute_func, point_count, point_count_lock):
+        """
+        Trigger ProMP conditioning at the current execution time point
+        
+        Args:
+            t_current: Current time in trajectory (normalized 0-1)
+            current_pose: Current robot pose [x, y, z, alpha, beta, gamma]
+            current_trajectory: Current trajectory being executed
+            trajectory_executing: Event flag for trajectory execution
+            execution_thread: Thread executing the trajectory
+            execute_func: Function to execute trajectory
+            point_count: List tracking current point index
+            point_count_lock: Lock for thread-safe access to point_count
+        """
+        if self.promp is None:
+            self.get_logger().error('ProMP not available for conditioning')
+            return
+        
+        try:
+            self.get_logger().info(f'Triggering ProMP conditioning at t={t_current:.3f} with pose: {current_pose}')
+            
+            # Normalize current pose for conditioning
+            if self.demo_min is not None and self.demo_max is not None:
+                current_pose_normalized = (current_pose - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+            else:
+                current_pose_normalized = current_pose
+            
+            # Condition ProMP at time t_current with current pose
+            self.promp.condition_on_waypoint(t_current, current_pose_normalized, self.promp_conditioning_sigma)
+            
+            # Generate new trajectory from conditioned ProMP
+            num_points = len(current_trajectory)
+            new_trajectory_normalized = self.promp.generate_trajectory(num_points=num_points)
+            
+            # Denormalize new trajectory
+            if self.demo_min is not None and self.demo_max is not None:
+                new_trajectory = new_trajectory_normalized * (self.demo_max - self.demo_min) + self.demo_min
+                new_trajectory = np.clip(new_trajectory, self.demo_min, self.demo_max)
+            else:
+                new_trajectory = new_trajectory_normalized
+            
+            self.get_logger().info(f'Generated new trajectory from conditioned ProMP (shape: {new_trajectory.shape})')
+            
+            # Get current execution progress
+            with point_count_lock:
+                current_idx = point_count[0]
+            
+            # Merge new trajectory: keep executed part, replace future part
+            # The new trajectory starts from t=0, so we need to extract the part from t_current onwards
+            new_trajectory_start_idx = int(t_current * num_points)
+            new_trajectory_start_idx = np.clip(new_trajectory_start_idx, 0, num_points - 1)
+            
+            # Merge: executed part + new conditioned part
+            merged_trajectory = np.vstack((
+                current_trajectory[:current_idx],
+                new_trajectory[new_trajectory_start_idx:]
+            ))
+            
+            # Interrupt current execution
+            trajectory_executing.clear()  # Signal to stop current trajectory
+            
+            # Send STOP to robot
+            try:
+                self.kuka_socket.sendall(b"STOP\n")
+                self.get_logger().info('Sent STOP to robot to apply conditioned trajectory')
+                
+                # Wait for STOPPED response
+                self.kuka_socket.settimeout(2.0)
+                try:
+                    response = self._receive_complete_message(self.kuka_socket, timeout=2.0)
+                    if response and "STOPPED" in response:
+                        self.get_logger().info('Robot stopped successfully, restarting with conditioned trajectory')
+                    else:
+                        self.get_logger().warn('Did not receive STOPPED confirmation, proceeding anyway')
+                except socket.timeout:
+                    self.get_logger().warn('Timeout waiting for STOPPED, proceeding with new trajectory')
+                finally:
+                    self.kuka_socket.settimeout(None)
+            except Exception as e:
+                self.get_logger().error(f'Error sending STOP: {e}')
+            
+            # Restart trajectory execution from current point with merged trajectory
+            trajectory_from_current = merged_trajectory[current_idx:]
+            
+            execution_thread = threading.Thread(
+                target=execute_func,
+                args=(trajectory_from_current,)
+            )
+            execution_thread.daemon = True
+            execution_thread.start()
+            trajectory_executing.set()  # Reset flag
+            
+            # Update point count to reflect the restart point
+            with point_count_lock:
+                point_count[0] = current_idx
+            
+            # Update current trajectory
+            self.current_trajectory = merged_trajectory
+            
+            self.conditioning_count += 1
+            self.get_logger().info(f'ProMP conditioning completed and execution restarted from point {current_idx} (t={t_current:.3f})')
+            self.conditioning_status_pub.publish(String(data=f'CONDITIONING_COMPLETED:t={t_current:.3f}'))
+            
+        except Exception as e:
+            self.get_logger().error(f'Error during ProMP conditioning: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
     
     def handle_trajectory_deformation_and_incremental_learning(self, current_trajectory, human_input,
                                                                trajectory_executing, execution_thread,
