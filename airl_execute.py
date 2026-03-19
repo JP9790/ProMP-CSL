@@ -76,6 +76,7 @@ class AIRLExecute(Node):
         self.learned_trajectory = None
         self.learned_joint_trajectory = None  # Joint space trajectory
         self.demos = []
+        self.normalized_demos = []  # Normalized demos used for AIRL training and reward computation
         
         # Normalization statistics for denormalizing generated trajectories
         self.demo_min = None
@@ -448,6 +449,9 @@ class AIRLExecute(Node):
             demo_normalized = (demo - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
             normalized_scaled.append(demo_normalized)
         
+        # Store normalized demos for later reward computation
+        self.normalized_demos = normalized_scaled
+        
         # Debug: print shape of each normalized demo
         for i, demo in enumerate(normalized_scaled):
             self.get_logger().debug(f"Normalized demo {i} shape: {demo.shape}, range: [{np.min(demo):.3f}, {np.max(demo):.3f}]")
@@ -661,6 +665,8 @@ class AIRLExecute(Node):
                     
                     # Save CSV files after completion
                     self.save_execution_data_to_csv()
+                    # Also compute and save rewards for demos and final execution
+                    self.save_rewards_to_csv()
                     return True
                 elif "ERROR" in response:
                     error_count += 1
@@ -706,6 +712,8 @@ class AIRLExecute(Node):
                 
                 # Save CSV files even if execution didn't complete
                 self.save_execution_data_to_csv()
+                # Also attempt to compute and save rewards for available trajectory
+                self.save_rewards_to_csv()
                 
                 # Return True if we made some progress, False if nothing worked
                 if point_count > 0:
@@ -720,6 +728,113 @@ class AIRLExecute(Node):
             self.get_logger().error(traceback.format_exc())
             # Save CSV files even on error
             self.save_execution_data_to_csv()
+            # Also attempt to compute and save rewards even on error (if data available)
+            self.save_rewards_to_csv()
+            return False
+    
+    def _compute_trajectory_reward(self, trajectory_states):
+        """
+        Compute total reward for a single trajectory given states in Cartesian space.
+        The states are first normalized using the demo statistics so that they match
+        the scale used during AIRL training.
+        """
+        if self.airl is None:
+            self.get_logger().error('AIRL is not trained; cannot compute rewards')
+            return None
+        
+        states = np.array(trajectory_states)
+        if states.ndim != 2 or states.shape[1] != 6 or len(states) < 2:
+            self.get_logger().error(f'Invalid trajectory for reward computation: shape {states.shape}')
+            return None
+        
+        # Normalize using demo statistics if available
+        if self.demo_min is not None and self.demo_max is not None:
+            states_norm = (states - self.demo_min) / (self.demo_max - self.demo_min + 1e-10)
+        else:
+            states_norm = states
+        
+        # Actions are differences between consecutive states
+        actions = np.diff(states_norm, axis=0)
+        actions = np.vstack([actions, np.zeros((1, states_norm.shape[1]))])
+        
+        total_reward = 0.0
+        for s, a in zip(states_norm, actions):
+            total_reward += self.airl.compute_reward(s, a)
+        
+        return total_reward
+    
+    def save_rewards_to_csv(self):
+        """
+        Compute reward for each demo trajectory and for the final executed trajectory,
+        then save them into a CSV file.
+        
+        CSV format example for 2 demos:
+            reward, demo1, demo2, final executed
+            total,  <demo1_reward>, <demo2_reward>, <final_reward>
+        """
+        try:
+            if self.airl is None:
+                self.get_logger().warn('AIRL not trained; skipping reward CSV generation')
+                return False
+            
+            if len(self.demos) == 0:
+                self.get_logger().warn('No demonstrations loaded; skipping reward CSV generation')
+                return False
+            
+            # Ensure normalized demos are available (used only for consistent scaling)
+            if not self.normalized_demos:
+                self.normalize_demos()
+            
+            # Compute rewards for each demo (using original, denormalized trajectories)
+            demo_rewards = []
+            for idx, demo in enumerate(self.demos):
+                reward_val = self._compute_trajectory_reward(demo)
+                if reward_val is None:
+                    self.get_logger().warn(f'Failed to compute reward for demo {idx + 1}')
+                    demo_rewards.append(float('nan'))
+                else:
+                    demo_rewards.append(reward_val)
+            
+            # Determine final executed trajectory to evaluate
+            if len(self.execution_trajectory_log) > 0:
+                final_traj = self.execution_trajectory_log
+            elif self.learned_trajectory is not None:
+                final_traj = self.learned_trajectory
+            else:
+                self.get_logger().warn('No executed or learned trajectory available; skipping final reward computation')
+                final_traj = None
+            
+            final_reward = None
+            if final_traj is not None:
+                final_reward = self._compute_trajectory_reward(final_traj)
+            
+            # Prepare CSV directory and filename
+            os.makedirs(self.result_directory, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            rewards_file = os.path.join(self.result_directory, f'trajectory_rewards_{timestamp}.csv')
+            
+            # Build header: reward, demo1, demo2, ..., final executed
+            header = ['reward']
+            header.extend([f'demo{i + 1}' for i in range(len(demo_rewards))])
+            header.append('final executed')
+            
+            # Single row with total rewards
+            row = ['total']
+            row.extend(demo_rewards)
+            row.append(final_reward if final_reward is not None else float('nan'))
+            
+            with open(rewards_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerow(row)
+            
+            self.get_logger().info(f'Saved trajectory rewards to {rewards_file}')
+            return True
+        
+        except Exception as e:
+            self.get_logger().error(f'Error computing or saving trajectory rewards: {e}')
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             return False
     
     def save_execution_data_to_csv(self):
