@@ -377,8 +377,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     // The robot will be compliant during motion, allowing physical interaction
                     CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
                     // Apply only rotational stiffness (A/B/C) to make rotation compliance match `stiffness_rot`
-                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.ROT)
-                                         .setStiffness(srot);
+                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.A).setStiffness(srot);
+                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.B).setStiffness(srot);
+                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.C).setStiffness(srot);
                     
                     // Cancel PositionHold before executing trajectory point
                     if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
