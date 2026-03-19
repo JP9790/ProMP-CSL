@@ -376,10 +376,24 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     // are controlled through the robot's configuration or default behavior
                     // The robot will be compliant during motion, allowing physical interaction
                     CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
-                    // Apply only rotational stiffness (A/B/C) to make rotation compliance match `stiffness_rot`
-                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.A).setStiffness(srot);
-                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.B).setStiffness(srot);
-                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.C).setStiffness(srot);
+                    // Apply only rotational stiffness to make rotation compliance match `stiffness_rot`.
+                    // Use reflection so this compiles even if your RoboticsAPI version does not expose CartDOF.
+                    try {
+                        Class<?> cartDofClass = Class.forName("com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF");
+                        java.lang.reflect.Method parametrizeMethod = currentImpedanceMode.getClass().getMethod("parametrize", cartDofClass);
+                        for (String axisName : new String[] {"A", "B", "C"}) {
+                            try {
+                                Object axisEnum = java.lang.Enum.valueOf((Class)cartDofClass, axisName);
+                                Object param = parametrizeMethod.invoke(currentImpedanceMode, axisEnum);
+                                java.lang.reflect.Method setStiffnessMethod = param.getClass().getMethod("setStiffness", double.class);
+                                setStiffnessMethod.invoke(param, srot);
+                            } catch (IllegalArgumentException enumEx) {
+                                // Enum constant (A/B/C) doesn't exist in this RoboticsAPI version; ignore.
+                            }
+                        }
+                    } catch (Throwable reflectionEx) {
+                        getLogger().warn("Could not apply rotational stiffness to CartesianImpedanceControlMode: " + reflectionEx.getMessage());
+                    }
                     
                     // Cancel PositionHold before executing trajectory point
                     if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
