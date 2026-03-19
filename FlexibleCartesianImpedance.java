@@ -35,7 +35,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private double stiffnessX = 250.0; // N/m
     private double stiffnessY = 250.0;
     private double stiffnessZ = 250.0;
-    private double stiffnessRot = 50.0; // Nm/rad
+    private double stiffnessRot = 50.0; // Nm/rad (lowered for more rotational compliance)
+    private double rotationStiffnessScale = 0.5; // Scale applied to stiffness_rot from data.xml (so runtime config is also reduced)
     private double damping = 0.7; // Damping ratio
     
     // PositionHold stiffness - small value to hold against gravity while remaining compliant
@@ -375,6 +376,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                     // are controlled through the robot's configuration or default behavior
                     // The robot will be compliant during motion, allowing physical interaction
                     CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
+                    // Apply only rotational stiffness (A/B/C) to make rotation compliance match `stiffness_rot`
+                    currentImpedanceMode.parametrize(com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF.ROT)
+                                         .setStiffness(srot);
                     
                     // Cancel PositionHold before executing trajectory point
                     if (positionHold != null && currentMotion != null && !currentMotion.isFinished()) {
@@ -1382,7 +1386,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             stiffnessX = Double.parseDouble(getApplicationData().getProcessData("stiffness_x").getValue().toString());
             stiffnessY = Double.parseDouble(getApplicationData().getProcessData("stiffness_y").getValue().toString());
             stiffnessZ = Double.parseDouble(getApplicationData().getProcessData("stiffness_z").getValue().toString());
-            stiffnessRot = Double.parseDouble(getApplicationData().getProcessData("stiffness_rot").getValue().toString());
+            double stiffnessRotRaw = Double.parseDouble(getApplicationData().getProcessData("stiffness_rot").getValue().toString());
+            stiffnessRot = stiffnessRotRaw * rotationStiffnessScale;
             damping = Double.parseDouble(getApplicationData().getProcessData("damping_ratio").getValue().toString());
         
             // Load PositionHold stiffness (if available, otherwise use default)
