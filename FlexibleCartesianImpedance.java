@@ -273,6 +273,132 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         return trajectory;
     }
 
+    /** Logged once: which CartesianImpedanceControlMode stiffness-related APIs exist on this RoboticsAPI build. */
+    private static boolean cartesianImpedanceApiProbed = false;
+
+    /** Logged once: clarify that joint-space execution ignores {@code stiffness_rot}. */
+    private static boolean loggedJointTrajectoryStiffnessNote = false;
+
+    /**
+     * Apply Cartesian impedance stiffness (and optional damping) using reflection over {@code CartDOF},
+     * because RoboticsAPI versions differ in enum names and some IDEs do not ship the KUKA jars for static typing.
+     *
+     * <p><b>Why rotation can still feel stiff:</b>
+     * <ul>
+     *   <li>If this method fails or matches zero rotational DOFs, the controller keeps the <b>robot default</b>
+     *       Cartesian rotational stiffness (often high).</li>
+     *   <li>{@code damping} from {@code data.xml} is applied here only to <b>rotational</b> DOFs when {@code setDamping(double)} exists;
+     *       if it is not applied, default damping can make motion feel stiff even when stiffness is moderate.</li>
+     *   <li>Joint-space execution ({@code JOINT_TRAJECTORY}) uses {@link JointImpedanceControlMode} with
+     *       {@code position_hold_stiffness} per joint — {@code stiffness_rot} does <b>not</b> define TCP rotational
+     *       compliance on that path.</li>
+     * </ul>
+     *
+     * @return {@code true} if stiffness was set on at least one rotational CartDOF.
+     */
+    private boolean applyCartesianImpedanceStiffnessFromConfiguration(
+            CartesianImpedanceControlMode mode,
+            double sx, double sy, double sz,
+            double srotNmPerRad,
+            double dampingRatio) {
+        // Typical iiwa rotational stiffness range (Nm/rad). Values outside may be ignored by the controller.
+        final double sRotClamped = Math.max(0.1, Math.min(300.0, srotNmPerRad));
+        if (Math.abs(sRotClamped - srotNmPerRad) > 1e-6) {
+            getLogger().warn("stiffness_rot=" + srotNmPerRad + " Nm/rad is outside [0.1, 300.0]; using clamped value " + sRotClamped);
+        }
+
+        if (!cartesianImpedanceApiProbed) {
+            cartesianImpedanceApiProbed = true;
+            StringBuilder apis = new StringBuilder();
+            for (java.lang.reflect.Method m : mode.getClass().getMethods()) {
+                String mn = m.getName();
+                if (mn.toLowerCase(Locale.US).contains("stiff") || mn.toLowerCase(Locale.US).contains("damp")) {
+                    apis.append("\n  ").append(m);
+                }
+            }
+            getLogger().info("CartesianImpedanceControlMode stiffness/damping-related methods on this API:" + apis);
+        }
+
+        int rotConfigured = 0;
+        int transConfigured = 0;
+        StringBuilder rotDetail = new StringBuilder();
+        StringBuilder transDetail = new StringBuilder();
+
+        try {
+            Class<?> cartDofClass = Class.forName("com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF");
+            java.lang.reflect.Method parametrizeMethod = mode.getClass().getMethod("parametrize", cartDofClass);
+            Object[] cartDofs = (Object[]) cartDofClass.getEnumConstants();
+            if (cartDofs == null || cartDofs.length == 0) {
+                getLogger().error("CartDOF enum has no constants; cannot configure Cartesian impedance.");
+                return false;
+            }
+
+            for (Object dof : cartDofs) {
+                String name = ((Enum<?>) dof).name();
+                String u = name.toUpperCase(Locale.US);
+
+                // Rotation first (avoid misclassifying RX/RY/RZ as "contains X" translation heuristics).
+                boolean isRotation =
+                        u.equals("A") || u.equals("B") || u.equals("C")
+                        || u.equals("ALPHA") || u.equals("BETA") || u.equals("GAMMA")
+                        || u.equals("RX") || u.equals("RY") || u.equals("RZ")
+                        || u.equals("RA") || u.equals("RB") || u.equals("RC")
+                        || u.equals("ROTX") || u.equals("ROTY") || u.equals("ROTZ")
+                        || u.contains("ROT") || u.contains("R_X") || u.contains("R_Y") || u.contains("R_Z");
+
+                boolean isTranslation =
+                        u.equals("X") || u.equals("Y") || u.equals("Z")
+                        || u.equals("TX") || u.equals("TY") || u.equals("TZ")
+                        || u.equals("TRANSX") || u.equals("TRANSY") || u.equals("TRANSZ");
+
+                if (!isRotation && !isTranslation) {
+                    continue;
+                }
+
+                Object param = parametrizeMethod.invoke(mode, dof);
+                java.lang.reflect.Method setStiffnessMethod = param.getClass().getMethod("setStiffness", double.class);
+
+                if (isRotation) {
+                    setStiffnessMethod.invoke(param, sRotClamped);
+                    rotConfigured++;
+                    rotDetail.append(name).append("=").append(sRotClamped).append("; ");
+
+                    // Optional: set rotational damping if API exposes it (reduces "snappy" stiff feel).
+                    try {
+                        java.lang.reflect.Method setDampingMethod = param.getClass().getMethod("setDamping", double.class);
+                        setDampingMethod.invoke(param, dampingRatio);
+                    } catch (NoSuchMethodException ignore) {
+                        // Not all API versions expose per-DOF damping here.
+                    }
+                } else {
+                    double k = sx;
+                    if (u.equals("Y") || u.equals("TY") || u.equals("TRANSY")) {
+                        k = sy;
+                    } else if (u.equals("Z") || u.equals("TZ") || u.equals("TRANSZ")) {
+                        k = sz;
+                    }
+                    setStiffnessMethod.invoke(param, k);
+                    transConfigured++;
+                    transDetail.append(name).append("=").append(k).append("; ");
+                }
+            }
+
+            getLogger().info("Cartesian impedance DOF stiffness applied — translation DOFs: " + transConfigured
+                    + " [" + transDetail + "], rotation DOFs: " + rotConfigured + " [" + rotDetail + "]"
+                    + ", dampingRatio(rot only if supported)=" + dampingRatio);
+
+            if (rotConfigured == 0) {
+                getLogger().error("No rotational CartDOF matched this RoboticsAPI build; rotational stiffness was NOT set — "
+                        + "robot default rotational stiffness likely remains HIGH.");
+            }
+            return rotConfigured > 0;
+
+        } catch (Throwable t) {
+            getLogger().error("Failed to configure Cartesian impedance stiffness via reflection: " + t.getMessage());
+            return false;
+        }
+    }
+
     private void executeTrajectory(String trajectoryData) {
         if (robot == null) {
             getLogger().error("Cannot execute trajectory: robot is null");
@@ -316,7 +442,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().info("Stiffness: X=" + sx + ", Y=" + sy + ", Z=" + sz + 
                            ", RotX=" + srot + ", RotY=" + srot + ", RotZ=" + srot);
             getLogger().info("Damping: " + damp);
-            getLogger().info("Note: CartesianImpedanceControlMode uses default impedance values from robot configuration");
+            getLogger().info("Note: Cartesian stiffness is applied per CartDOF via reflection (see logs below); "
+                    + "if rotation DOFs are not matched, robot-default rotational stiffness remains.");
             
             // Execute trajectory with continuous impedance control for real-time deformation
             for (int i = 0; i < trajectory.size(); i++) {
@@ -371,28 +498,13 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                         // Ignore - just a warning check
                     }
                     
-                    // Create CartesianImpedanceControlMode for compliant motion
-                    // Note: CartesianImpedanceControlMode uses default constructor - impedance values
-                    // are controlled through the robot's configuration or default behavior
-                    // The robot will be compliant during motion, allowing physical interaction
+                    // Cartesian impedance for this LIN segment: stiffness/damping are configured via
+                    // applyCartesianImpedanceStiffnessFromConfiguration(...) (reflection over CartDOF).
                     CartesianImpedanceControlMode currentImpedanceMode = new CartesianImpedanceControlMode();
-                    // Apply only rotational stiffness to make rotation compliance match `stiffness_rot`.
-                    // Use reflection so this compiles even if your RoboticsAPI version does not expose CartDOF.
-                    try {
-                        Class<?> cartDofClass = Class.forName("com.kuka.roboticsAPI.motionModel.controlModeModel.CartDOF");
-                        java.lang.reflect.Method parametrizeMethod = currentImpedanceMode.getClass().getMethod("parametrize", cartDofClass);
-                        for (String axisName : new String[] {"A", "B", "C"}) {
-                            try {
-                                Object axisEnum = java.lang.Enum.valueOf((Class)cartDofClass, axisName);
-                                Object param = parametrizeMethod.invoke(currentImpedanceMode, axisEnum);
-                                java.lang.reflect.Method setStiffnessMethod = param.getClass().getMethod("setStiffness", double.class);
-                                setStiffnessMethod.invoke(param, srot);
-                            } catch (IllegalArgumentException enumEx) {
-                                // Enum constant (A/B/C) doesn't exist in this RoboticsAPI version; ignore.
-                            }
-                        }
-                    } catch (Throwable reflectionEx) {
-                        getLogger().warn("Could not apply rotational stiffness to CartesianImpedanceControlMode: " + reflectionEx.getMessage());
+                    boolean rotStiffnessApplied = applyCartesianImpedanceStiffnessFromConfiguration(
+                            currentImpedanceMode, sx, sy, sz, srot, damp);
+                    if (!rotStiffnessApplied) {
+                        getLogger().error("Rotational Cartesian stiffness may still be at controller defaults (often feels very stiff).");
                     }
                     
                     // Cancel PositionHold before executing trajectory point
@@ -1305,6 +1417,13 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             }
             
             getLogger().info("Executing joint trajectory with " + jointTrajectory.size() + " points");
+            if (!loggedJointTrajectoryStiffnessNote) {
+                loggedJointTrajectoryStiffnessNote = true;
+                getLogger().warn("Joint trajectory path uses JointImpedanceControlMode with stiffness = position_hold_stiffness ("
+                        + positionHoldStiffness + " Nm/rad per joint). "
+                        + "The data.xml value stiffness_rot / Cartesian rotation stiffness does NOT set TCP rotational "
+                        + "compliance on this execution path.");
+            }
             
             // Execute joint trajectory using PTP (Point-to-Point) motion
             // PTP with joint positions avoids workspace errors
