@@ -37,10 +37,19 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private double stiffnessZ = 250.0;
     private double stiffnessRot = 50.0; // Nm/rad (lowered for more rotational compliance)
     private double rotationStiffnessScale = 0.5; // Scale applied to stiffness_rot from data.xml (so runtime config is also reduced)
+    /** Extra scale on Cartesian rotational stiffness only (does not affect joint-space PTP). Default below 1 softens TCP rotation. */
+    private double cartesianRotationEffectiveScale = 0.3;
+    /** Larger deviation (rad) allows easier orientation tracking / less fight against the user (Cartesian path only). */
+    private double cartesianRotationMaxPathDeviationRad = 0.25;
     private double damping = 0.7; // Damping ratio
     
     // PositionHold stiffness - small value to hold against gravity while remaining compliant
     private double positionHoldStiffness = 50.0; // Nm/rad per joint (low enough for compliance, high enough to resist gravity)
+    /**
+     * Joint-space PTP ({@code JOINT_TRAJECTORY}) uses this per-joint stiffness — NOT {@code stiffness_rot}.
+     * Keep this lower than {@link #positionHoldStiffness} if you want softer TCP rotation during joint trajectories.
+     */
+    private double jointTrajectoryImpedanceStiffness = 15.0; // Nm/rad per joint
     
     // External torque threshold for human interaction (matching cartesianimpedance.java)
     private double forceThreshold = 10.0; // N
@@ -306,6 +315,12 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         if (Math.abs(sRotClamped - srotNmPerRad) > 1e-6) {
             getLogger().warn("stiffness_rot=" + srotNmPerRad + " Nm/rad is outside [0.1, 300.0]; using clamped value " + sRotClamped);
         }
+        // Extra softening for Cartesian rotation only (see cartesianRotationEffectiveScale in data.xml / defaults).
+        final double sRotEffective = Math.max(0.1, Math.min(300.0, sRotClamped * cartesianRotationEffectiveScale));
+        if (Math.abs(sRotEffective - sRotClamped) > 1e-6) {
+            getLogger().info("Cartesian rotation stiffness scaled: " + sRotClamped + " -> " + sRotEffective
+                    + " Nm/rad (cartesian_rotation_effective_scale=" + cartesianRotationEffectiveScale + ")");
+        }
 
         if (!cartesianImpedanceApiProbed) {
             cartesianImpedanceApiProbed = true;
@@ -359,9 +374,17 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 java.lang.reflect.Method setStiffnessMethod = param.getClass().getMethod("setStiffness", double.class);
 
                 if (isRotation) {
-                    setStiffnessMethod.invoke(param, sRotClamped);
+                    setStiffnessMethod.invoke(param, sRotEffective);
                     rotConfigured++;
-                    rotDetail.append(name).append("=").append(sRotClamped).append("; ");
+                    rotDetail.append(name).append("=").append(sRotEffective).append("; ");
+
+                    // Optional: larger orientation path deviation => less fight when user rotates the tool.
+                    try {
+                        java.lang.reflect.Method setMaxDev = param.getClass().getMethod("setMaxPathDeviation", double.class);
+                        setMaxDev.invoke(param, cartesianRotationMaxPathDeviationRad);
+                    } catch (NoSuchMethodException ignore) {
+                        // Not all API versions expose this on the parametrized DOF object.
+                    }
 
                     // Optional: set rotational damping if API exposes it (reduces "snappy" stiff feel).
                     try {
@@ -1419,10 +1442,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().info("Executing joint trajectory with " + jointTrajectory.size() + " points");
             if (!loggedJointTrajectoryStiffnessNote) {
                 loggedJointTrajectoryStiffnessNote = true;
-                getLogger().warn("Joint trajectory path uses JointImpedanceControlMode with stiffness = position_hold_stiffness ("
-                        + positionHoldStiffness + " Nm/rad per joint). "
-                        + "The data.xml value stiffness_rot / Cartesian rotation stiffness does NOT set TCP rotational "
-                        + "compliance on this execution path.");
+                getLogger().warn("Joint trajectory uses JointImpedanceControlMode with joint_trajectory_stiffness = "
+                        + jointTrajectoryImpedanceStiffness + " Nm/rad per joint (NOT stiffness_rot). "
+                        + "Lower joint_trajectory_stiffness in data.xml if TCP rotation still feels stiff.");
             }
             
             // Execute joint trajectory using PTP (Point-to-Point) motion
@@ -1441,12 +1463,12 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                         currentMotion.cancel();
                     }
                     
-                    // Use JointImpedanceControlMode for compliant PTP motion
+                    // Use JointImpedanceControlMode for compliant PTP motion (softer than PositionHold for easier rotation)
+                    double kPtp = jointTrajectoryImpedanceStiffness;
                     JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(
-                        positionHoldStiffness, positionHoldStiffness, positionHoldStiffness,
-                        positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, positionHoldStiffness
+                        kPtp, kPtp, kPtp, kPtp, kPtp, kPtp, kPtp
                     );
-                    impedanceMode.setStiffnessForAllJoints(positionHoldStiffness);
+                    impedanceMode.setStiffnessForAllJoints(kPtp);
                     
                     // Execute PTP motion with impedance control
                     currentMotion = robot.moveAsync(ptp(targetJoint).setMode(impedanceMode));
@@ -1532,6 +1554,23 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 getLogger().info("position_hold_stiffness not found in data.xml, using default: " + positionHoldStiffness);
             }
         
+            try {
+                jointTrajectoryImpedanceStiffness = Double.parseDouble(getApplicationData().getProcessData("joint_trajectory_stiffness").getValue().toString());
+            } catch (Exception e) {
+                getLogger().info("joint_trajectory_stiffness not found in data.xml, using default: " + jointTrajectoryImpedanceStiffness
+                        + " Nm/rad (PTP joint trajectory; lower for easier TCP rotation)");
+            }
+            try {
+                cartesianRotationEffectiveScale = Double.parseDouble(getApplicationData().getProcessData("cartesian_rotation_effective_scale").getValue().toString());
+            } catch (Exception e) {
+                getLogger().info("cartesian_rotation_effective_scale not found in data.xml, using default: " + cartesianRotationEffectiveScale);
+            }
+            try {
+                cartesianRotationMaxPathDeviationRad = Double.parseDouble(getApplicationData().getProcessData("cartesian_rotation_max_path_deviation_rad").getValue().toString());
+            } catch (Exception e) {
+                getLogger().info("cartesian_rotation_max_path_deviation_rad not found in data.xml, using default: " + cartesianRotationMaxPathDeviationRad);
+            }
+        
             // Load interaction thresholds
             forceThreshold = Double.parseDouble(getApplicationData().getProcessData("force_threshold").getValue().toString());
             torqueThreshold = Double.parseDouble(getApplicationData().getProcessData("torque_threshold").getValue().toString());
@@ -1545,6 +1584,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().info("Stiffness: X=" + stiffnessX + ", Y=" + stiffnessY + ", Z=" + stiffnessZ + ", Rot=" + stiffnessRot);
             getLogger().info("Damping: " + damping);
             getLogger().info("PositionHold stiffness: " + positionHoldStiffness + " Nm/rad (for gravity compensation while remaining compliant)");
+            getLogger().info("Joint trajectory PTP stiffness: " + jointTrajectoryImpedanceStiffness + " Nm/rad (joint_trajectory_stiffness — main knob for soft rotation during JOINT_TRAJECTORY)");
+            getLogger().info("Cartesian rotation scale: " + cartesianRotationEffectiveScale + ", max path deviation rad: " + cartesianRotationMaxPathDeviationRad);
         
         } catch (Exception e) {
             getLogger().error("Error loading configuration: " + e.getMessage());
