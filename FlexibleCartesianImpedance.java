@@ -35,23 +35,23 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private double stiffnessX = 250.0; // N/m
     private double stiffnessY = 250.0;
     private double stiffnessZ = 250.0;
-    private double stiffnessRot = 50.0; // Nm/rad (lowered for more rotational compliance)
-    private double rotationStiffnessScale = 0.5; // Scale applied to stiffness_rot from data.xml (so runtime config is also reduced)
+    private double stiffnessRot = 40.0; // Nm/rad default (further reduced for softer rotation)
+    private double rotationStiffnessScale = 0.42; // Scale applied to stiffness_rot from data.xml
     /** Extra scale on Cartesian rotational stiffness only (does not affect joint-space PTP). Default below 1 softens TCP rotation. */
-    private double cartesianRotationEffectiveScale = 0.3;
+    private double cartesianRotationEffectiveScale = 0.24;
     /** Larger deviation (rad) allows easier orientation tracking / less fight against the user (Cartesian path only). */
-    private double cartesianRotationMaxPathDeviationRad = 0.25;
+    private double cartesianRotationMaxPathDeviationRad = 0.32;
     private double damping = 0.7; // Damping ratio
     
     // PositionHold stiffness - small value to hold against gravity while remaining compliant
     private double positionHoldStiffness = 50.0; // Nm/rad for base joints (1-3); wrist uses scale below
     /** Multiplier for joints 4-7 only (wrist). Lower => easier TCP rotation during idle / PositionHold. */
-    private double positionHoldWristStiffnessScale = 0.35;
+    private double positionHoldWristStiffnessScale = 0.28;
     /**
      * Joint-space PTP ({@code JOINT_TRAJECTORY}) uses this per-joint stiffness — NOT {@code stiffness_rot}.
      * Keep this lower than {@link #positionHoldStiffness} if you want softer TCP rotation during joint trajectories.
      */
-    private double jointTrajectoryImpedanceStiffness = 15.0; // Nm/rad per joint
+    private double jointTrajectoryImpedanceStiffness = 12.0; // Nm/rad per joint
     
     // External torque threshold for human interaction (matching cartesianimpedance.java)
     private double forceThreshold = 10.0; // N
