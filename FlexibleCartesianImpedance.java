@@ -44,7 +44,9 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
     private double damping = 0.7; // Damping ratio
     
     // PositionHold stiffness - small value to hold against gravity while remaining compliant
-    private double positionHoldStiffness = 50.0; // Nm/rad per joint (low enough for compliance, high enough to resist gravity)
+    private double positionHoldStiffness = 50.0; // Nm/rad for base joints (1-3); wrist uses scale below
+    /** Multiplier for joints 4-7 only (wrist). Lower => easier TCP rotation during idle / PositionHold. */
+    private double positionHoldWristStiffnessScale = 0.35;
     /**
      * Joint-space PTP ({@code JOINT_TRAJECTORY}) uses this per-joint stiffness — NOT {@code stiffness_rot}.
      * Keep this lower than {@link #positionHoldStiffness} if you want softer TCP rotation during joint trajectories.
@@ -105,17 +107,15 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
         }
         
         // Setup PositionHold with joint impedance control for compliant waiting
-        // Use small stiffness to hold against gravity while remaining compliant for physical interaction
+        // Base joints (1-3) keep full stiffness for gravity; wrist (4-7) use lower stiffness for easier rotation
         getLogger().info("Setting up PositionHold with impedance control for compliant waiting...");
         try {
-            // Use JointImpedanceControlMode with small stiffness to resist gravity but remain compliant
-            // Small stiffness (50 Nm/rad) prevents gravity drift while still allowing physical interaction
+            double[] ks = buildPositionHoldJointStiffness();
             JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(
-                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, 
-                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, positionHoldStiffness
-            );
-            impedanceMode.setStiffnessForAllJoints(positionHoldStiffness);
-            getLogger().info("JointImpedanceControlMode created with stiffness: " + positionHoldStiffness + " Nm/rad (low enough for compliance, high enough to resist gravity)");
+                ks[0], ks[1], ks[2], ks[3], ks[4], ks[5], ks[6]);
+            getLogger().info("JointImpedanceControlMode (PositionHold): J1-3=" + positionHoldStiffness
+                    + " Nm/rad, J4-7=" + String.format(Locale.US, "%.1f", ks[3])
+                    + " Nm/rad (wrist scale=" + positionHoldWristStiffnessScale + ")");
             
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
             getLogger().info("PositionHold created successfully");
@@ -420,6 +420,18 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().error("Failed to configure Cartesian impedance stiffness via reflection: " + t.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Stiffness for {@link PositionHold} at startup and after trajectories: base joints (1-3) keep full
+     * {@link #positionHoldStiffness} for gravity; wrist joints (4-7) are scaled by
+     * {@link #positionHoldWristStiffnessScale} so the arm feels softer to rotate at application start.
+     */
+    private double[] buildPositionHoldJointStiffness() {
+        double k = positionHoldStiffness;
+        double kw = k * positionHoldWristStiffnessScale;
+        kw = Math.max(1.0, Math.min(300.0, kw));
+        return new double[] { k, k, k, kw, kw, kw, kw };
     }
 
     private void executeTrajectory(String trajectoryData) {
@@ -773,15 +785,12 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 currentMotion.cancel();
             }
             
-            // Use JointImpedanceControlMode with small stiffness to resist gravity but remain compliant
-            // Small stiffness prevents gravity drift while still allowing physical interaction
+            double[] ks = buildPositionHoldJointStiffness();
             JointImpedanceControlMode impedanceMode = new JointImpedanceControlMode(
-                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, 
-                positionHoldStiffness, positionHoldStiffness, positionHoldStiffness, positionHoldStiffness
-            );
-            impedanceMode.setStiffnessForAllJoints(positionHoldStiffness);
+                ks[0], ks[1], ks[2], ks[3], ks[4], ks[5], ks[6]);
             
-            getLogger().info("Restarting PositionHold with joint impedance control (stiffness: " + positionHoldStiffness + " Nm/rad)");
+            getLogger().info("Restarting PositionHold: J1-3=" + positionHoldStiffness + " Nm/rad, J4-7="
+                    + String.format(Locale.US, "%.1f", ks[3]) + " Nm/rad (wrist scale=" + positionHoldWristStiffnessScale + ")");
             
             // Create new PositionHold with joint impedance control
             positionHold = new PositionHold(impedanceMode, -1, java.util.concurrent.TimeUnit.MINUTES);
@@ -1553,6 +1562,12 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
                 // Use default if not configured
                 getLogger().info("position_hold_stiffness not found in data.xml, using default: " + positionHoldStiffness);
             }
+            try {
+                positionHoldWristStiffnessScale = Double.parseDouble(getApplicationData().getProcessData("position_hold_wrist_stiffness_scale").getValue().toString());
+            } catch (Exception e) {
+                getLogger().info("position_hold_wrist_stiffness_scale not found in data.xml, using default: " + positionHoldWristStiffnessScale
+                        + " (joints 4-7 stiffness = position_hold_stiffness * this; lower => easier rotation at startup)");
+            }
         
             try {
                 jointTrajectoryImpedanceStiffness = Double.parseDouble(getApplicationData().getProcessData("joint_trajectory_stiffness").getValue().toString());
@@ -1583,7 +1598,8 @@ public class FlexibleCartesianImpedance extends RoboticsAPIApplication {
             getLogger().info("ROS2 PC IP: " + ros2PCIP);
             getLogger().info("Stiffness: X=" + stiffnessX + ", Y=" + stiffnessY + ", Z=" + stiffnessZ + ", Rot=" + stiffnessRot);
             getLogger().info("Damping: " + damping);
-            getLogger().info("PositionHold stiffness: " + positionHoldStiffness + " Nm/rad (for gravity compensation while remaining compliant)");
+            getLogger().info("PositionHold: base J1-3=" + positionHoldStiffness + " Nm/rad, wrist scale J4-7=" + positionHoldWristStiffnessScale
+                    + " (effective wrist ~" + String.format(Locale.US, "%.1f", positionHoldStiffness * positionHoldWristStiffnessScale) + " Nm/rad)");
             getLogger().info("Joint trajectory PTP stiffness: " + jointTrajectoryImpedanceStiffness + " Nm/rad (joint_trajectory_stiffness — main knob for soft rotation during JOINT_TRAJECTORY)");
             getLogger().info("Cartesian rotation scale: " + cartesianRotationEffectiveScale + ", max path deviation rad: " + cartesianRotationMaxPathDeviationRad);
         
